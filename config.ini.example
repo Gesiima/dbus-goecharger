@@ -1,58 +1,59 @@
 [DEFAULT]
-; --- Bestehende Optionen (unveraendert aus dem Original) ---
+; --- Existing options (unchanged from the original) ---
 AccessType = OnPremise
 SignOfLifeLog = 1
 Deviceinstance = 43
-; go-e Hardware-Generation. Steuert nur noch die Temperatur-Auswertung (MCU/Temperature) -
-; die Energie-Berechnung (eto) laeuft in diesem Fork unabhaengig davon einheitlich ueber
-; die API-v2-Einheit (Wh), da der Endpunkt /api/status immer API v2 liefert.
+; go-e hardware generation. Only affects the temperature reading (MCU/Temperature) -
+; energy calculation (eto) is handled uniformly via the API v2 unit (Wh) in this
+; fork, since the /api/status endpoint always returns API v2 data.
 HardwareVersion = 4
-; 0 = AC Output (kritische Lasten), 1 = AC Input
+; 0 = AC Output (critical loads), 1 = AC Input
 AcPosition = 1
 Logging = INFO
 
 ; =========================================================================
-; --- Erweiterte Ladesteuerung (optional) ---
+; --- Extended charge control (optional) ---
 ; =========================================================================
-; Master-Schalter. Bei 'false' (oder wenn die Zeile fehlt) verhaelt sich das
-; Skript exakt wie das Original: reines Monitoring, /Mode ist nicht schreibbar,
-; keine Schreibzugriffe auf lmo/fup/pgt/Scheduler, kein PV-Ueberschuss-Push.
-; Alle folgenden Optionen sind dann wirkungslos.
+; Master switch. When 'false' (or the line is missing), this script behaves
+; exactly like the original: monitoring only, /Mode is not writable, no writes
+; to lmo/fup/pgt/scheduler, no PV surplus push. All options below have no
+; effect in that case.
 EnableChargeControl = true
 
-; --- Netz-Zielwert (nur im Auto-Modus) ---
-; Wird beim Aktivieren des Auto-Modus als 'pgt' an den go-e gesendet.
-; Zielleistung am Netzanschlusspunkt in W. Positive Werte = leichter Netzbezug,
-; negative Werte = leichte Einspeisung.
-; Bei einer Hausbatterie, die dem go-e nicht direkt bekannt ist, empfiehlt go-e
-; selbst -200 W, zusammen mit "Strom ins Netz bevorzugen" in der go-e-App
-; (App: PV-Ueberschuss -> Zielwert Netz / Leistungspraeferenz).
+; --- Grid target (Auto mode only) ---
+; Sent to the go-e as 'pgt' when Auto mode is activated.
+; Target power at the grid connection point, in W. Positive values = slight
+; grid import, negative values = slight feed-in.
+; If you have a home battery that the go-e cannot see directly, go-e itself
+; recommends -200 W, together with "prefer feeding to the grid" in the go-e app
+; (App: PV surplus -> Grid target / Power preference).
 PvGridTarget = -200
 
-; --- Akku-Prioritaet (nur im Auto-Modus) ---
-; Das EV wird erst geladen, wenn der Hausspeicher diesen SOC erreicht hat.
-; 0 oder Zeile weglassen = Funktion deaktiviert.
+; --- Battery priority (Auto mode only) ---
+; The EV only starts charging once the home battery has reached this SOC.
+; 0 or omit the line = feature disabled.
 BatteryPriorityMinSoc = 60
-; Hysterese in Prozentpunkten: Laden pausiert unter BatteryPriorityMinSoc und wird
-; erst wieder freigegeben, wenn der SOC BatteryPriorityMinSoc + Hysterese erreicht.
-; Verhindert Flackern genau an der Schwelle.
+; Hysteresis in percentage points: charging pauses below BatteryPriorityMinSoc
+; and is only released again once SOC reaches BatteryPriorityMinSoc + hysteresis.
+; Prevents flapping right at the threshold.
 BatteryPriorityHysteresis = 2
 
-; --- Akku als Ladepuffer (nur im Auto-Modus) ---
-; Oberhalb dieses SOC darf zusaetzlich Energie aus dem Hausspeicher ins EV fliessen
-; (virtueller Ueberschuss-Aufschlag auf pPv).
-; 0 oder Zeile weglassen = Funktion deaktiviert.
+; --- Battery as a charging buffer (Auto mode only) ---
+; Above this SOC, additional energy from the home battery is allowed to flow
+; into the EV (virtual surplus added to pPv).
+; 0 or omit the line = feature disabled.
 BatterySupportMinSoc = 90
-; Zusaetzliche Leistung in W, die dem go-e als virtueller PV-Ueberschuss gemeldet wird.
-; Sollte die tatsaechliche Entladegrenze des Systems nicht ueberschreiten, sonst
-; wird die Differenz aus dem Netz gedeckt.
+; Additional power in W reported to the go-e as virtual PV surplus.
+; Should not exceed the system's actual discharge limit, otherwise the
+; difference will be drawn from the grid instead.
 BatterySupportPower = 2500
-; Hysterese in Prozentpunkten: Puffer bleibt aktiv bis BatterySupportMinSoc - Hysterese.
+; Hysteresis in percentage points: the buffer stays active down to
+; BatterySupportMinSoc - hysteresis.
 BatterySupportHysteresis = 2
 
 [ONPREMISE]
 Host = 192.168.2.36
-; Abfrageintervall in ms. Muss fuer den PV-Ueberschuss-Push im Auto-Modus bei
-; maximal 5000 liegen, da der go-e die Werte pGrid/pPv/pAkku alle 5 Sekunden
-; erwartet, sonst greift der interne go-e-Watchdog (~6s) und die Werte verfallen.
+; Poll interval in ms. Must be at most 5000 for the PV surplus push in Auto
+; mode, since the go-e expects pGrid/pPv/pAkku to be updated every 5 seconds,
+; otherwise the go-e's internal watchdog (~6s) kicks in and the values expire.
 PauseBetweenRequests = 5000
