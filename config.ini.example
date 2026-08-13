@@ -1,0 +1,58 @@
+[DEFAULT]
+; --- Bestehende Optionen (unveraendert aus dem Original) ---
+AccessType = OnPremise
+SignOfLifeLog = 1
+Deviceinstance = 43
+; go-e Hardware-Generation. Steuert nur noch die Temperatur-Auswertung (MCU/Temperature) -
+; die Energie-Berechnung (eto) laeuft in diesem Fork unabhaengig davon einheitlich ueber
+; die API-v2-Einheit (Wh), da der Endpunkt /api/status immer API v2 liefert.
+HardwareVersion = 4
+; 0 = AC Output (kritische Lasten), 1 = AC Input
+AcPosition = 1
+Logging = INFO
+
+; =========================================================================
+; --- Erweiterte Ladesteuerung (optional) ---
+; =========================================================================
+; Master-Schalter. Bei 'false' (oder wenn die Zeile fehlt) verhaelt sich das
+; Skript exakt wie das Original: reines Monitoring, /Mode ist nicht schreibbar,
+; keine Schreibzugriffe auf lmo/fup/pgt/Scheduler, kein PV-Ueberschuss-Push.
+; Alle folgenden Optionen sind dann wirkungslos.
+EnableChargeControl = true
+
+; --- Netz-Zielwert (nur im Auto-Modus) ---
+; Wird beim Aktivieren des Auto-Modus als 'pgt' an den go-e gesendet.
+; Zielleistung am Netzanschlusspunkt in W. Positive Werte = leichter Netzbezug,
+; negative Werte = leichte Einspeisung.
+; Bei einer Hausbatterie, die dem go-e nicht direkt bekannt ist, empfiehlt go-e
+; selbst -200 W, zusammen mit "Strom ins Netz bevorzugen" in der go-e-App
+; (App: PV-Ueberschuss -> Zielwert Netz / Leistungspraeferenz).
+PvGridTarget = -200
+
+; --- Akku-Prioritaet (nur im Auto-Modus) ---
+; Das EV wird erst geladen, wenn der Hausspeicher diesen SOC erreicht hat.
+; 0 oder Zeile weglassen = Funktion deaktiviert.
+BatteryPriorityMinSoc = 60
+; Hysterese in Prozentpunkten: Laden pausiert unter BatteryPriorityMinSoc und wird
+; erst wieder freigegeben, wenn der SOC BatteryPriorityMinSoc + Hysterese erreicht.
+; Verhindert Flackern genau an der Schwelle.
+BatteryPriorityHysteresis = 2
+
+; --- Akku als Ladepuffer (nur im Auto-Modus) ---
+; Oberhalb dieses SOC darf zusaetzlich Energie aus dem Hausspeicher ins EV fliessen
+; (virtueller Ueberschuss-Aufschlag auf pPv).
+; 0 oder Zeile weglassen = Funktion deaktiviert.
+BatterySupportMinSoc = 90
+; Zusaetzliche Leistung in W, die dem go-e als virtueller PV-Ueberschuss gemeldet wird.
+; Sollte die tatsaechliche Entladegrenze des Systems nicht ueberschreiten, sonst
+; wird die Differenz aus dem Netz gedeckt.
+BatterySupportPower = 2500
+; Hysterese in Prozentpunkten: Puffer bleibt aktiv bis BatterySupportMinSoc - Hysterese.
+BatterySupportHysteresis = 2
+
+[ONPREMISE]
+Host = 192.168.2.36
+; Abfrageintervall in ms. Muss fuer den PV-Ueberschuss-Push im Auto-Modus bei
+; maximal 5000 liegen, da der go-e die Werte pGrid/pPv/pAkku alle 5 Sekunden
+; erwartet, sonst greift der interne go-e-Watchdog (~6s) und die Werte verfallen.
+PauseBetweenRequests = 5000
