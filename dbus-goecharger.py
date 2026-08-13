@@ -37,7 +37,14 @@ class DbusGoeChargerService:
     # last alw value we ourselves commanded via battery priority (None = never set).
     # Prevents alw from being rewritten unnecessarily on every cycle (every 5s).
     self._lastAlwCommanded = None
-    self._settingsPaths = {}
+    # last amp value we ourselves commanded in Auto mode (None = never set).
+    # IMPORTANT: 'amp' is written to flash on every set on API v2 hardware
+    # (unlike the API v1-only 'amx' key, which does not exist on this API v2
+    # charger and was confirmed absent via live testing). To avoid excessive
+    # flash wear (~100,000 write cycles) from writing every 5s, 'amp' is only
+    # written when the computed target current actually changes - matching
+    # how evcc's own go-e driver behaves (confirmed via evcc source code).
+    self._lastCommandedAmp = None
 
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
@@ -102,30 +109,11 @@ class DbusGoeChargerService:
       self._dbusservice.add_path(
         path, settings['initial'], gettextcallback=settings['textformat'], writeable=True, onchangecallback=self._handlechangedvalue)
 
-    # Additionally publish the tuning values as writable D-Bus paths, so they
-    # can be adjusted via the VRM portal (Device List -> device -> Advanced)
-    # without editing config.ini. Initial values come from config.ini. Changes
-    # made via VRM take effect immediately but are NOT written back to
-    # config.ini - after a restart, the config.ini values apply again.
-    if self._chargeControlEnabled:
-      settingsDefaults = {
-        '/Settings/PvGridTarget': int(config['DEFAULT'].get('PvGridTarget', 0)),
-        '/Settings/BatteryPriorityMinSoc': int(config['DEFAULT'].get('BatteryPriorityMinSoc', 0)),
-        '/Settings/BatteryPriorityHysteresis': int(config['DEFAULT'].get('BatteryPriorityHysteresis', 2)),
-        '/Settings/BatterySupportMinSoc': int(config['DEFAULT'].get('BatterySupportMinSoc', 0)),
-        '/Settings/BatterySupportPower': int(config['DEFAULT'].get('BatterySupportPower', 0)),
-        '/Settings/BatterySupportHysteresis': int(config['DEFAULT'].get('BatterySupportHysteresis', 2)),
-      }
-      for path, initial in settingsDefaults.items():
-        self._dbusservice.add_path(path, initial, writeable=True, onchangecallback=self._handlechangedvalue)
-        self._settingsPaths[path] = initial
-
     # register the service (only after ALL paths have been added)
     self._dbusservice.register()
 
     if self._chargeControlEnabled:
       logging.info("EnableChargeControl=true: Auto/Manual/Scheduled control is active")
-      logging.info("Tuning values adjustable via VRM under /Settings/*: %s" % list(self._settingsPaths.keys()))
     else:
       logging.info("EnableChargeControl=false (or not set): monitoring only, no mode control")
 
@@ -184,19 +172,30 @@ class DbusGoeChargerService:
 
   def _setGoeChargerValueV2(self, parameter, value):
     '''
-    Sets a go-e API v2 key (lmo, fup, pgt, alw, amp, ama, psm, sch_week, ...) via
-    the /api/set?ids= endpoint. This is the single, unified way to write any
-    value - the older /mqtt?payload= endpoint was removed: in practice, 'alw'
-    repeatedly and persistently failed over it (error status/no response),
-    while 'amp' worked fine over the very same endpoint. The exact cause was
-    never conclusively determined. /api/set has worked reliably for every key
-    tested so far and is therefore used consistently throughout.
+    Sets a simple, scalar go-e API v2 key (lmo, fup, frc, alw, amp, ama, psm, ...)
+    via a direct query parameter on /api/set (e.g. /api/set?lmo=4) - NOT via the
+    ids={...} JSON-batch parameter.
+
+    ROOT CAUSE FOUND (after extensive live testing): earlier versions of this
+    method wrapped every key in ids={"key":value}, matching the mechanism
+    required for pGrid/pPv/pAkku and the scheduler objects (which have no
+    single-key setter and genuinely require ids=). For simple scalar keys like
+    lmo/frc, however, this was wrong: manual tests using the plain query
+    parameter form (?lmo=4, ?frc=1) were rock-solid stable, while the exact
+    same values sent via ids={"lmo":4} were silently reverted by the go-e
+    within well under a second. The two write paths are evidently handled
+    differently internally by the firmware. Plain query parameters are
+    therefore used here; ids={...} is reserved for pGrid/pPv/pAkku and the
+    scheduler objects, which are set directly in their respective methods.
     '''
     config = self._getConfig()
-    payload = json.dumps({parameter: value})
     baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
+    if isinstance(value, bool):
+      paramValue = 'true' if value else 'false'
+    else:
+      paramValue = str(value)
     try:
-      request_data = requests.get(url=baseURL, params={'ids': payload}, timeout=2)
+      request_data = requests.get(url=baseURL, params={parameter: paramValue}, timeout=2)
     except Exception as e:
       logging.warning("go-eCharger v2 set failed for %s=%s: %s" % (parameter, value, e))
       return False
@@ -238,18 +237,13 @@ class DbusGoeChargerService:
 
   def _getSetting(self, name, default):
     '''
-    Reads a tuning value. The (possibly VRM-modified) D-Bus value under
-    /Settings/<name> is preferred; if the path does not exist (e.g. when
-    EnableChargeControl=false), it falls back to config.ini.
+    Reads a tuning value directly and freshly from config.ini every time it is
+    called (config.ini is re-parsed on every call via _getConfig()). This
+    means an edit to config.ini takes effect on the very next Auto-mode cycle
+    or mode switch - no service restart required for these tuning values.
+    (Only DEFAULT/ONPREMISE keys read at service startup, such as
+    Deviceinstance or Host, still require a restart to take effect.)
     '''
-    path = '/Settings/%s' % name
-    if path in self._settingsPaths:
-      try:
-        value = self._dbusservice[path]
-        if value is not None:
-          return int(value)
-      except Exception:
-        pass
     config = self._getConfig()
     return int(config['DEFAULT'].get(name, default))
 
@@ -282,32 +276,74 @@ class DbusGoeChargerService:
   def _applyChargeMode(self):
     '''
     Sends the selected charge mode to the go-e:
-    Auto (1)      -> lmo=4 (Eco mode), fup=true, scheduler off, grid target (pgt)
+    Auto (1)      -> lmo=4 (Eco mode), fup=true, frc=0 (neutral - let the Eco
+                     algorithm decide on/off itself), grid target (pgt)
                      (go-e takes over PV surplus control, including phase
                      switching, by itself)
-    Scheduled (2) -> lmo=3, scheduler on (control=1, times remain as defined in the go-e app)
-    Manual (0)    -> lmo=3, scheduler off (direct control via SetCurrent/StartStop)
+    Scheduled (2) -> lmo=3, frc=0 (neutral - let the go-e's own schedule decide on/off)
+    Manual (0)    -> lmo=3, frc=1 (force off) as a safe default when entering
+                     Manual, direct control afterwards via SetCurrent/StartStop
+
+    IMPORTANT finding from live testing: plain alw=false is NOT reliably
+    respected by the go-e while its own Eco algorithm considers charging
+    active/justified (e.g. right after a PV surplus push) - it gets silently
+    reverted back to alw=true within seconds. The dedicated 'frc' (force state:
+    0=Neutral, 1=Off, 2=On) key reliably overrides this and was confirmed
+    stable over 15+ seconds in testing, unlike alw alone.
     '''
     try:
       # When leaving Auto mode, reset the battery-priority state and, if
       # charging had been locked because of it, release it again - otherwise
-      # alw=false would remain in effect and the user would not be able to
+      # frc=1 would remain in effect and the user would not be able to
       # charge in Manual mode.
       if self._chargeMode != 1:
         if self._lastAlwCommanded == False:
           try:
-            self._setGoeChargerValueV2('alw', True)
+            self._setGoeChargerValueV2('frc', 0)
             logging.info("Battery priority lifted (mode switch) - charging released again")
           except Exception as e:
-            logging.warning("Could not set alw=true on mode switch: %s" % e)
+            logging.warning("Could not release frc on mode switch: %s" % e)
         self._batteryPriorityPaused = False
         self._batterySupportActive = False
         self._lastAlwCommanded = None
+        self._lastCommandedAmp = None
 
       if self._chargeMode == 1:
         ok = self._setGoeChargerValueV2('lmo', 4)
         self._setGoeChargerValueV2('fup', True)
-        self._setGoeSchedulerEnabled(False)
+        self._setGoeChargerValueV2('frc', 0)
+        # ROOT CAUSE FOUND (after extensive live testing): 'amp' is NOT the
+        # live-regulated charge current - it is a CEILING that the go-e's Eco
+        # algorithm will not exceed. The actual, live-regulated current is
+        # reflected in nrg[4] (A) / nrg[11] (W), never in 'amp' itself. If
+        # 'amp' was left at a low value (e.g. 6, from Manual mode or an
+        # earlier test), the Eco algorithm is silently capped there and
+        # cannot regulate upward at all - this looked exactly like "the Eco
+        # algorithm doesn't respond to pGrid" during many hours of testing,
+        # when in fact it was working correctly the whole time, just capped
+        # by our own leftover ceiling. Confirmed live: with amp raised to 16,
+        # a simulated ~2070W surplus (9A) made the real current climb from
+        # ~5.6A to ~8.2A and rising within 40s - clear, genuine regulation.
+        # The ceiling is therefore raised to the device's configured maximum
+        # (ama/'/MaxCurrent') every time Auto mode is (re-)entered, so the Eco
+        # algorithm always has its full intended regulation range available -
+        # this is NOT computing the charge current ourselves, it only removes
+        # an artificial constraint so the go-e's own algorithm can do its job.
+        try:
+          maxAmp = int(self._dbusservice['/MaxCurrent'])
+        except Exception:
+          maxAmp = 0
+        if maxAmp > 0:
+          ok2 = self._setGoeChargerValueV2('amp', maxAmp)
+          if ok2:
+            self._lastCommandedAmp = maxAmp
+          logging.info("Auto mode: amp ceiling raised to %dA (device max) so the Eco algorithm can regulate freely" % maxAmp)
+        else:
+          logging.warning("Auto mode: /MaxCurrent not available - could not raise amp ceiling, Eco algorithm may stay capped at its last value")
+        # TEMPORARILY DISABLED for debugging: _setGoeSchedulerEnabled(False) -
+        # this call reliably fails with a 500 error (URL too long for the go-e's
+        # HTTP server) and is suspected of destabilizing lmo under real load.
+        # self._setGoeSchedulerEnabled(False)
         gridTarget = self._getSetting('PvGridTarget', 0)
         self._setGoeChargerValueV2('pgt', gridTarget)
         logging.info("Grid target (pgt) set: %s W" % gridTarget)
@@ -319,7 +355,8 @@ class DbusGoeChargerService:
       elif self._chargeMode == 2:
         ok = self._setGoeChargerValueV2('lmo', 3)
         self._setGoeChargerValueV2('fup', False)
-        self._setGoeSchedulerEnabled(True)
+        self._setGoeChargerValueV2('frc', 0)
+        # self._setGoeSchedulerEnabled(True)  # TEMPORARILY DISABLED for debugging
         if ok:
           self._lastCommandedLmo = 3
         else:
@@ -328,7 +365,8 @@ class DbusGoeChargerService:
       else:
         ok = self._setGoeChargerValueV2('lmo', 3)
         self._setGoeChargerValueV2('fup', False)
-        self._setGoeSchedulerEnabled(False)
+        self._setGoeChargerValueV2('frc', 1)
+        # self._setGoeSchedulerEnabled(False)  # TEMPORARILY DISABLED for debugging
         if ok:
           self._lastCommandedLmo = 3
         else:
@@ -360,11 +398,35 @@ class DbusGoeChargerService:
     try:
       config = self._getConfig()
 
+      # Safety net for the 'amp' ceiling (see _applyChargeMode for the full
+      # root-cause explanation): _applyChargeMode() only raises the ceiling
+      # at the moment of an explicit mode switch via the GUI/D-Bus callback.
+      # If the service restarts while the go-e is ALREADY in Auto mode (e.g.
+      # after a service or Venus OS restart), that code path is never hit -
+      # _update()'s external-change-detection only adopts the existing mode
+      # without calling _applyChargeMode(). This check runs on every Auto-mode
+      # cycle instead, so the ceiling is guaranteed to be raised regardless of
+      # how Auto mode was entered - not just when switched via the GUI.
+      try:
+        maxAmp = int(self._dbusservice['/MaxCurrent'])
+      except Exception:
+        maxAmp = 0
+      if maxAmp > 0 and self._lastCommandedAmp != maxAmp:
+        ok = self._setGoeChargerValueV2('amp', maxAmp)
+        if ok:
+          logging.info("Auto mode: amp ceiling (re)confirmed at %dA (device max)" % maxAmp)
+          self._lastCommandedAmp = maxAmp
+        else:
+          logging.warning("Could not confirm amp ceiling at %dA - will retry next cycle" % maxAmp)
+
       # Battery priority: only release EV charging once the battery SOC has
       # reached a configured minimum threshold (similar to the evcc setting).
       # Hysteresis (default 2%) prevents frequent on/off flapping right at the
       # threshold: charging pauses below minSoc, and is only released again once
-      # SOC >= minSoc + hysteresis.
+      # SOC >= minSoc + hysteresis. This only updates self._batteryPriorityPaused;
+      # the actual frc write happens in one combined place below, together with
+      # the insufficient-surplus check, to avoid two independent code paths
+      # writing frc back-to-back in the same cycle.
       minBatterySoc = self._getSetting('BatteryPriorityMinSoc', 0)
       if minBatterySoc > 0 and self._batterySocItem is not None:
         hysteresis = self._getSetting('BatteryPriorityHysteresis', 2)
@@ -379,24 +441,9 @@ class DbusGoeChargerService:
           else:
             if batterySoc < minBatterySoc:
               self._batteryPriorityPaused = True
-
           if self._batteryPriorityPaused:
-            if not self._lastAlwCommanded == False:
-              ok = self._setGoeChargerValueV2('alw', False)
-              if ok:
-                self._lastAlwCommanded = False
-              else:
-                logging.warning("Could not set alw=false (battery priority) - will retry next cycle")
-            logging.debug("Auto mode: battery SOC %s%% < %s%% - EV charging paused (battery priority)" %
+            logging.debug("Auto mode: battery SOC %s%% < %s%% - EV charging should pause (battery priority)" %
                           (batterySoc, minBatterySoc))
-            return
-          else:
-            if not self._lastAlwCommanded == True:
-              ok = self._setGoeChargerValueV2('alw', True)
-              if ok:
-                self._lastAlwCommanded = True
-              else:
-                logging.warning("Could not set alw=true - will retry next cycle")
 
       gridPower = self._gridPowerItem.get_value()
       pvPowerAc = self._pvPowerAcItem.get_value()
@@ -439,11 +486,40 @@ class DbusGoeChargerService:
               self._batterySupportActive = True
 
           if self._batterySupportActive:
-            pPv += supportPower
-            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> +%sW virtual surplus" %
+            # IMPORTANT finding from live testing: pGrid, not pPv, appears to
+            # be the value that actually drives the go-e's charging decision -
+            # every successful test so far worked by making pGrid sufficiently
+            # negative; adding only to pPv while pGrid stayed near zero
+            # produced no reaction at all, even though pAkku correctly showed
+            # the battery discharging. The virtual surplus is therefore added
+            # to pGrid (making it more negative = more exportable surplus),
+            # not to pPv.
+            pGrid -= supportPower
+            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> pGrid adjusted by -%sW virtual surplus" %
                           (batterySocForSupport, maxSocForSupport, supportHysteresis, supportPower))
 
-      payload = json.dumps({"pGrid": pGrid, "pPv": pPv, "pAkku": pAkku})
+      # Pause/release decision for battery priority. The go-e's own Eco
+      # algorithm DOES regulate the actual charge current live from
+      # pGrid/pPv/pAkku (confirmed by live testing - see _applyChargeMode for
+      # the root-cause finding about the 'amp' ceiling); the actual current
+      # itself is intentionally not computed or set here.
+      if self._batteryPriorityPaused:
+        if not self._lastAlwCommanded == False:
+          ok = self._setGoeChargerValueV2('frc', 1)
+          if ok:
+            self._lastAlwCommanded = False
+          else:
+            logging.warning("Could not set frc=1 - will retry next cycle")
+        return
+      else:
+        if not self._lastAlwCommanded == True:
+          ok = self._setGoeChargerValueV2('frc', 0)
+          if ok:
+            self._lastAlwCommanded = True
+          else:
+            logging.warning("Could not release frc - will retry next cycle")
+
+      payload = json.dumps({"pGrid": int(round(pGrid)), "pPv": int(round(pPv)), "pAkku": int(round(pAkku))})
       baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
       requests.get(url=baseURL, params={'ids': payload}, timeout=1)
 
@@ -604,7 +680,20 @@ class DbusGoeChargerService:
     if path == '/SetCurrent':
       return self._setGoeChargerValueV2('amp', int(value))
     elif path == '/StartStop':
-      return self._setGoeChargerValueV2('alw', bool(int(value)))
+      # NOTE: writing 'alw' directly via a plain query parameter returns
+      # HTTP 500 ("tried to set api key without setter") - the same error
+      # pattern seen with pGrid/pPv/pAkku early on. 'alw' therefore appears to
+      # need the ids={} form, but doing so gets silently reverted by the go-e's
+      # own Eco algorithm within moments (the very problem 'frc' was
+      # introduced to solve). Live testing showed that 'frc' alone - without
+      # ever successfully writing 'alw' - was sufficient for charging to
+      # actually start (with an observed ~30s delay, matching the go-e's
+      # general PV-surplus-mode startup timing measured elsewhere - this may
+      # be an inherent ramp-up/handshake delay in the charger itself, not
+      # something dependent on 'alw'). 'alw' is therefore no longer written
+      # here at all.
+      enable = bool(int(value))
+      return self._setGoeChargerValueV2('frc', 0 if enable else 1)
     elif path == '/MaxCurrent':
       return self._setGoeChargerValueV2('ama', int(value))
     elif path == '/Mode':
@@ -616,16 +705,6 @@ class DbusGoeChargerService:
         return False
       self._chargeMode = int(value)
       self._applyChargeMode()
-      return True
-    elif path in self._settingsPaths:
-      # Tuning value changed via VRM - will automatically be picked up by
-      # _getSetting() from the next cycle onward. Not written back to
-      # config.ini, so after a restart of the service the config.ini value
-      # applies again.
-      logging.info("Setting %s changed via VRM to %s (not persistent, config.ini remains unchanged)" % (path, value))
-      if path == '/Settings/PvGridTarget' and self._chargeMode == 1:
-        # pgt only takes effect once actively sent to the go-e - so set it immediately
-        self._setGoeChargerValueV2('pgt', int(value))
       return True
     else:
       logging.info("mapping for evcharger path %s does not exist" % (path))
