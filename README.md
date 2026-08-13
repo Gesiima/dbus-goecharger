@@ -147,6 +147,15 @@ For extended charge control, see `config.ini.example` for all options.
 - https://github.com/victronenergy/venus/wiki/dbus
 - https://github.com/victronenergy/venus/wiki/dbus-api
 
+## Attribution
+
+This project is built collaboratively: the coding is done by Claude (Anthropic),
+while the features are developed together. All requirements, architectural
+decisions, real-hardware testing, and every correction and refinement come from
+Gesiima; Claude turns them into code iteratively. No code was written manually -
+the implementation happens entirely through step-by-step instructions and joint
+review.
+
 ## Credits
 
 Based on the work of [vikt0rm](https://github.com/vikt0rm/dbus-goecharger),
