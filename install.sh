@@ -9,6 +9,9 @@ chmod 744 $SCRIPT_DIR/restart.sh
 chmod a+x $SCRIPT_DIR/uninstall.sh
 chmod 744 $SCRIPT_DIR/uninstall.sh
 
+chmod a+x $SCRIPT_DIR/pvcheck.sh
+chmod 744 $SCRIPT_DIR/pvcheck.sh
+
 chmod a+x $SCRIPT_DIR/service/run
 chmod 755 $SCRIPT_DIR/service/run
 

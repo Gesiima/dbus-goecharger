@@ -40,7 +40,7 @@ sharing the knowledge:
   "Charging") as soon as a poll cycle fails, and back to `1` as soon as the
   go-e responds again - both only written when the value actually changes.
 
-### `/AutoStart` repurposed as a manual phase-switching override (always active, independent of `EnableChargeControl`)
+### `/AutoStart` repurposed as a configurable manual phase-switching override (always active, independent of `EnableChargeControl`)
 
 Like `/StartStop` and `/SetCurrent`, this works regardless of the
 `EnableChargeControl` setting - it is not part of the "optional features"
@@ -55,14 +55,28 @@ anything to it, leaving the GUI button greyed out with nothing behind it), it
 is deliberately **repurposed** here for something genuinely useful instead:
 manual override of go-e's phase-switching logic (`psm`).
 
-- `/AutoStart = 1` -> `psm = 0` (**Auto** - go-e's own live, surplus-based
-  1-/3-phase switching; the normal/default state)
-- `/AutoStart = 0` -> `psm = 1` (**force single-phase**, overriding Auto)
+**What the two toggle positions actually do is configurable** via
+`AutoStartMode` in `config.ini` - read once at startup only (a config edit
+needs a service restart to take effect, unlike most other settings, since
+this defines the meaning of a control path rather than a tuning value):
 
-`psm = 2` (force 3-phase) is deliberately never written by this toggle -
-Auto already switches to 3-phase automatically whenever surplus allows it, so
-a permanent 3-phase force would only remove that adaptability without any
-upside for a simple two-state button.
+- `AutoStartMode = 0`: disabled - the button has no function at all, `psm`
+  is never touched.
+- `AutoStartMode = 1` ("1P-Auto", **default**): `/AutoStart = 0` -> `psm = 1`
+  (force single-phase); `/AutoStart = 1` -> `psm = 0` (**Auto** - go-e's own
+  live, surplus-based 1-/3-phase switching).
+- `AutoStartMode = 2` ("3P-Auto"): `/AutoStart = 0` -> `psm = 2` (force
+  three-phase); `/AutoStart = 1` -> `psm = 0` (Auto).
+- `AutoStartMode = 3` ("1P-3P"): `/AutoStart = 0` -> `psm = 1` (force
+  single-phase); `/AutoStart = 1` -> `psm = 2` (force three-phase) - `psm = 0`
+  (Auto) is never used in this mode.
+
+This was added because a household with little PV surplus most of the time
+may prefer to default to forced single-phase and only occasionally check
+whether enough surplus exists for 3-phase, rather than constantly running
+Auto - modes 1 and 3 both suit that use case, depending on whether the
+"probing" toggle position should hand control back to Auto or force 3-phase
+outright.
 
 **Important caveat, by direct analogy with the `frc` relay-click findings
 above:** phase switching is documented and reported by other users to
@@ -73,13 +87,13 @@ does, to avoid unnecessary physical switching. **Confirmed live** that the
 `/AutoStart` toggle correctly forces single-phase charging via the go-e app.
 
 **External change detection:** if `psm` is changed directly in the go-e app
-instead of via the Venus OS `/AutoStart` toggle, this is now detected the
-same way external `lmo` changes are (see `/Mode` above) and `/AutoStart` is
-updated to match - `psm=1` (forced 1-phase) -> `/AutoStart=0`, anything else
-(`0`=Auto or `2`=forced 3-phase, the latter never written by this fork's own
-toggle but settable directly in the app) -> `/AutoStart=1`. This runs
-independently of `EnableChargeControl`, matching `/AutoStart`'s own
-independence from that setting (like `/StartStop`/`/SetCurrent`).
+instead of via the Venus OS `/AutoStart` toggle, this is detected the same
+way external `lmo` changes are (see `/Mode` above) and `/AutoStart` is
+updated to match - the exact mapping depends on `AutoStartMode` (mode 0
+leaves `/AutoStart` untouched entirely, since the toggle has no function to
+reflect). This runs independently of `EnableChargeControl`, matching
+`/AutoStart`'s own independence from that setting (like
+`/StartStop`/`/SetCurrent`).
 
 
 

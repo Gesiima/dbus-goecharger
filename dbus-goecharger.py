@@ -141,6 +141,20 @@ class DbusGoeChargerService:
       # otherwise, as in the original: a plain display value, not writable
       self._dbusservice.add_path('/Mode', 0)
 
+    # What the repurposed /AutoStart toggle actually does - read ONCE at
+    # startup only (unlike most other tuning values, which are re-read from
+    # config.ini on every cycle via _getSetting()), since this defines the
+    # very meaning of a control path and isn't something that should change
+    # its behaviour mid-session without a restart.
+    # 0 = disabled (button has no function at all - psm is never touched)
+    # 1 = "1P-Auto": AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> Auto (psm=0) [default, matches this fork's original behaviour]
+    # 2 = "3P-Auto": AutoStart=0 -> force 3-phase (psm=2), AutoStart=1 -> Auto (psm=0)
+    # 3 = "1P-3P":   AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> force 3-phase (psm=2) - Auto (psm=0) never used
+    self._autoStartMode = config.getint('DEFAULT', 'AutoStartMode', fallback=1)
+    if self._autoStartMode not in (0, 1, 2, 3):
+      logging.warning("AutoStartMode=%s is not a recognized value (0/1/2/3) - falling back to 1 (1P-Auto)" % self._autoStartMode)
+      self._autoStartMode = 1
+
     # add path values to dbus
     for path, settings in self._paths.items():
       self._dbusservice.add_path(
@@ -153,6 +167,8 @@ class DbusGoeChargerService:
       logging.info("EnableChargeControl=true: Auto/Manual/Scheduled control is active")
     else:
       logging.info("EnableChargeControl=false (or not set): monitoring only, no mode control")
+    logging.info("AutoStartMode=%s: %s" % (self._autoStartMode,
+                 {0: "disabled, /AutoStart has no function", 1: "1P-Auto", 2: "3P-Auto", 3: "1P-3P"}[self._autoStartMode]))
 
     # Private, separate connection to the system D-Bus, to read PV/grid/battery
     # values from com.victronenergy.system (for Auto mode / PV surplus push).
@@ -839,21 +855,29 @@ class DbusGoeChargerService:
           # switched psm directly in the go-e app, not via the repurposed
           # /AutoStart toggle in Venus OS). Only react if psm changed
           # WITHOUT us having set it ourselves last - same pattern as lmo
-          # below. psm: 0=Auto -> /AutoStart=1, 1=force 1-phase ->
-          # /AutoStart=0, 2=force 3-phase (never written by this fork's own
-          # toggle, but the user could still set it directly in the app) ->
-          # treated as /AutoStart=1 (closest fit: "not forced to 1-phase").
+          # below. The psm -> /AutoStart mapping depends on AutoStartMode
+          # (see __init__): mode 0 leaves /AutoStart untouched entirely
+          # (the toggle has no function, so there is nothing meaningful to
+          # reflect); modes 1-3 each treat one psm value as "off" (0) and
+          # everything else as "on" (1), matching whichever two states that
+          # mode's toggle actually switches between.
           # NOTE: deliberately OUTSIDE the EnableChargeControl block below -
           # /AutoStart, like /StartStop and /SetCurrent, works independently
           # of that setting.
-          currentPsm = int(data['psm']) if 'psm' in data and data['psm'] is not None else None
-          if currentPsm is not None and currentPsm != self._lastCommandedPsm:
-            newAutoStart = 0 if currentPsm == 1 else 1
-            if newAutoStart != self._dbusservice['/AutoStart']:
-              logging.info("External change detected: go-e psm=%s -> AutoStart set to %s" %
-                            (currentPsm, newAutoStart))
-              self._dbusservice['/AutoStart'] = newAutoStart
-            self._lastCommandedPsm = currentPsm
+          if self._autoStartMode != 0:
+            currentPsm = int(data['psm']) if 'psm' in data and data['psm'] is not None else None
+            if currentPsm is not None and currentPsm != self._lastCommandedPsm:
+              if self._autoStartMode == 1:
+                newAutoStart = 0 if currentPsm == 1 else 1
+              elif self._autoStartMode == 2:
+                newAutoStart = 0 if currentPsm == 2 else 1
+              else:  # mode 3: "1P-3P"
+                newAutoStart = 0 if currentPsm == 1 else 1
+              if newAutoStart != self._dbusservice['/AutoStart']:
+                logging.info("External change detected: go-e psm=%s -> AutoStart set to %s" %
+                              (currentPsm, newAutoStart))
+                self._dbusservice['/AutoStart'] = newAutoStart
+              self._lastCommandedPsm = currentPsm
 
           # The entire following block (mode sync, PV surplus push) only runs if
           # the new control logic has been explicitly enabled via config.ini.
@@ -1062,14 +1086,19 @@ class DbusGoeChargerService:
     elif path == '/AutoStart':
       # DELIBERATELY REPURPOSED (see paths dict comment in main() and
       # README): this is NOT Victron's official "start automatically when a
-      # vehicle is connected" semantic. Instead: 1 = Auto (go-e's own live
-      # surplus-based 1-/3-phase switching, psm=0), 0 = force single-phase
-      # (psm=1). Never writes psm=2 (force 3-phase) - Auto already covers
-      # that case dynamically whenever surplus allows it, and always forcing
-      # 3-phase would defeat the point of the automatic, surplus-aware
-      # switching for no benefit.
-      autoPhaseSwitching = bool(int(value))
-      return self._setPsm(0 if autoPhaseSwitching else 1)
+      # vehicle is connected" semantic. What it actually does depends on
+      # AutoStartMode from config.ini (read once at startup, see __init__):
+      # 0 = disabled, no function at all; 1 = "1P-Auto"; 2 = "3P-Auto";
+      # 3 = "1P-3P". See __init__ for the full mapping.
+      if self._autoStartMode == 0:
+        return True
+      enable = bool(int(value))
+      if self._autoStartMode == 1:
+        return self._setPsm(0 if enable else 1)
+      elif self._autoStartMode == 2:
+        return self._setPsm(0 if enable else 2)
+      elif self._autoStartMode == 3:
+        return self._setPsm(2 if enable else 1)
     elif path == '/MaxCurrent':
       return self._setGoeChargerValueV2('ama', int(value))
     elif path == '/Mode':
