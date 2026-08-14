@@ -404,6 +404,21 @@ below the 6-second watchdog threshold (recommended: 5000ms, as in the
 original), so that a single delayed HTTP request does not already trigger an
 unwanted pause.
 
+### Battery buffer flag could get stuck "active" if disabled mid-session
+
+**Found live:** if `BatterySupportMinSoc` (or `BatterySupportPower`) was
+edited to `0` in `config.ini` while the battery buffer feature was already
+active (e.g. an accidental typo while adjusting the value), the internal
+`_batterySupportActive` flag was never reset - the whole block that would
+normally re-evaluate and clear it lived entirely inside the
+`if maxSocForSupport > 0 and supportPower > 0...` guard, which is skipped
+once the value is `0`. This didn't cause an incorrect `pGrid` adjustment
+(that code is also inside the skipped block), but the flag and its "active"
+log messages misleadingly kept implying the feature was still engaged for as
+long as the service kept running in Auto mode. **Fixed** by explicitly
+resetting the flag (and logging it) when the feature is found disabled while
+it was previously active.
+
 ### Fresh PV data is pushed *before* activating Eco mode, not after
 
 **Found live:** switching Auto (charging on genuine surplus) -> Manual
@@ -457,24 +472,29 @@ something this fork's PV surplus push can influence.
 
 ### The grid target (`pgt`) acts continuously
 
-`pgt` is a persistent config value and continuously feeds into the Eco mode's
-current calculation - not just when it is set. Example: with `pGrid=-1800`
-(1800W surplus) and `pgt=-200` (200W reserve), the go-e charges at around 6A
-instead of the ~7-8A one would expect at a full 1800W, since 200W is subtracted
-as a buffer before the resulting charge current (rounded down to whole amps)
-is calculated. (This test predates the `amp`-ceiling discovery above and was
-incidentally not affected by it, since 6A happened to be at/below whatever
-ceiling was in effect at the time.)
+`pgt` is a persistent value (configured directly in the go-e app - see below)
+and continuously feeds into the Eco mode's current calculation - not just
+when it is set. Example: with `pGrid=-1800` (1800W surplus) and `pgt=-200`
+(200W reserve), the go-e charges at around 6A instead of the ~7-8A one would
+expect at a full 1800W, since 200W is subtracted as a buffer before the
+resulting charge current (rounded down to whole amps) is calculated. (This
+test predates the `amp`-ceiling discovery above and was incidentally not
+affected by it, since 6A happened to be at/below whatever ceiling was in
+effect at the time.)
 
-**Fixed: `PvGridTarget` config edits now apply live, without a restart.**
-`pgt` used to be sent to the go-e only once, at the exact moment of switching
-*to* Auto mode (`_applyChargeMode()`) - editing `PvGridTarget` in `config.ini`
-while already in Auto mode had no effect until the next mode switch or
-service restart, unlike other tuning values (`BatteryPriorityMinSoc` etc.)
-which are already re-read from `config.ini` every cycle. `pgt` is now
-re-checked every Auto-mode cycle the same way (tracked via
-`self._lastCommandedPgt`, only written when it actually changes) - a
-`config.ini` edit now takes effect on the very next cycle.
+**`pgt` is intentionally never written by this fork - configure it directly
+in the go-e app instead** (App: PV surplus -> Grid target / Power
+preference). An earlier version of this fork managed `pgt` via `config.ini`,
+including a fairly involved mechanism to reconcile `config.ini` edits with
+direct changes made in the go-e app (config.ini "winning" on a file change,
+an app-side change otherwise being adopted in-memory) - this added real
+complexity, and once, a real bug: an app-side change could be silently
+reverted again on the very next cycle, because the comparison used to
+determine "did config.ini change" couldn't distinguish a genuine file edit
+from the in-memory value having previously diverged via an adopted app-side
+change. Given `pgt` is just as easy to set once, directly where it actually
+takes effect, this fork now simply reads the current `pgt` value (only to
+inform the `BatterySupportCompensatePgt` option below) and never writes it.
 
 ## Restrictions
 
@@ -508,6 +528,103 @@ log level's meaning purely to force visibility. The existing multi-line
 `Logging` to `INFO` or `DEBUG` temporarily if periodic confirmation is
 needed beyond the one-time startup line.
 
+## Configuration reference
+
+`config.ini.example` intentionally only has short comments - full
+explanations for every option are here instead, grouped the same way as in
+the file.
+
+### Basic (unchanged from the original)
+
+- **`AccessType`**: always `OnPremise`.
+- **`SignOfLifeLog`**: minutes between periodic status log entries.
+- **`Deviceinstance`**: this device's Venus OS D-Bus instance number.
+- **`HardwareVersion`**: go-e hardware generation. Only affects the
+  temperature reading (`/MCU/Temperature`) - energy calculation (`eto`) is
+  handled uniformly via the API v2 unit (Wh) in this fork, since
+  `/api/status` always returns API v2 data.
+- **`AcPosition`**: `0` = AC Output (critical loads), `1` = AC Input.
+- **`Logging`**: `DEBUG`/`INFO`/`WARN`/etc. At `WARN`, one line is still
+  logged on successful startup regardless of this setting - see "Visible
+  startup confirmation" above.
+
+### Charge control master switch
+
+- **`EnableChargeControl`**: when `false` or omitted, this script behaves
+  exactly like the original - monitoring only, `/Mode` not writable, no
+  writes to `lmo`/`fup`/scheduler, no PV surplus push. Every option below
+  this line has no effect in that case.
+
+### Battery priority (Auto mode only)
+
+The EV only starts charging once the home battery has reached a configured
+SOC.
+
+- **`BatteryPriorityMinSoc`**: `0` or omit = feature disabled.
+- **`BatteryPriorityHysteresis`**: in percentage points. Charging pauses
+  below `BatteryPriorityMinSoc` and is only released again once SOC reaches
+  `BatteryPriorityMinSoc + hysteresis` - prevents flapping right at the
+  threshold.
+
+### Battery as a charging buffer (Auto mode only)
+
+Above a second, higher SOC, a configurable amount of home battery power is
+allowed to help charge the EV too (virtual surplus added to `pGrid`).
+
+- **`BatterySupportMinSoc`**: `0` or omit = feature disabled.
+- **`BatterySupportPower`**: additional power in W reported to the go-e as
+  virtual surplus. Should not exceed the system's actual discharge limit,
+  otherwise the difference is drawn from the grid instead.
+- **`BatterySupportHysteresis`**: in percentage points - the buffer stays
+  active down to `BatterySupportMinSoc - hysteresis`.
+- **`BatterySupportCompensatePgt`**: `1` (not `true` - this is read as a
+  number) compensates for `pgt`'s continuous reserve while the buffer is
+  active, by adding `pgt`'s magnitude on top of `BatterySupportPower` -
+  without this, `pgt` (configured in the go-e app, see below) reduces the
+  amount that actually reaches the charge current calculation below what you
+  configured here. The exact relationship between `pgt` and the resulting
+  current reduction has only been empirically observed, not confirmed as a
+  precise formula - this is a reasonable approximation, not a guaranteed
+  exact match. `0` or omit = disabled (default).
+
+### Grid target (`pgt`)
+
+Not configured here - set it directly in the go-e app instead (App: PV
+surplus -> Grid target / Power preference). See "`pgt` is intentionally
+never written by this fork" above for the reasoning. This script still reads
+the current value (only for `BatterySupportCompensatePgt` above), never
+writes it.
+
+### `/AutoStart` button function
+
+- **`AutoStartMode`**: what the repurposed Venus OS "Autostart" toggle does
+  (see "`/AutoStart` repurposed..." above for the full reasoning). Read once
+  at startup only - **a config.ini edit here needs a service restart**,
+  unlike every other option on this page.
+  - `0` = disabled, the button has no function at all (`psm` never touched)
+  - `1` = "1P-Auto" (default): Off -> force 1-phase (`psm=1`), On -> Auto (`psm=0`)
+  - `2` = "3P-Auto": Off -> force 3-phase (`psm=2`), On -> Auto (`psm=0`)
+  - `3` = "1P-3P": Off -> force 1-phase (`psm=1`), On -> force 3-phase (`psm=2`) - Auto/`psm=0` never used
+
+### `[ONPREMISE]`
+
+- **`Host`**: the go-e's IP address.
+- **`PauseBetweenRequests`**: poll interval in ms. Must stay at or below
+  5000, since the go-e expects `pGrid`/`pPv`/`pAkku` to be updated at least
+  every 5 seconds in Auto mode (see "Timing behaviour" above).
+
+### What needs a restart, and what doesn't
+
+Only `AutoStartMode` needs a restart to take effect (see above). Everything
+else in `[DEFAULT]` and `[ONPREMISE]` is either read once at genuine startup
+regardless (`AccessType`, `Deviceinstance`, `HardwareVersion`, `AcPosition`,
+`Logging`, `Host`, `PauseBetweenRequests`, `EnableChargeControl`) - these
+still need `restart.sh` after editing, since nothing re-reads them mid-run -
+or actively re-read every Auto-mode cycle without needing a restart
+(`BatteryPriorityMinSoc`, `BatteryPriorityHysteresis`, `BatterySupportMinSoc`,
+`BatterySupportPower`, `BatterySupportHysteresis`,
+`BatterySupportCompensatePgt`).
+
 ## Install & Configuration
 
 Get the code:
@@ -522,23 +639,20 @@ rm main.zip
 ```
 
 Check `config.ini` afterwards - most important is `Deviceinstance` and `Host`.
-For extended charge control, see `config.ini.example` for all options.
+See "Configuration reference" above for every option and what does/doesn't
+need a restart.
 
-⚠️ After any change to `.py` file, or to `Deviceinstance`/`Host`/`HardwareVersion`/
-`AcPosition`/`EnableChargeControl` in `config.ini`: run `restart.sh`.
+⚠️ After any change to the `.py` file, or to anything in `config.ini` that
+isn't re-read live (see "What needs a restart, and what doesn't" above): run
+`restart.sh`.
 
-Note: the Auto-mode tuning values (`PvGridTarget`, `BatteryPriorityMinSoc`,
-`BatteryPriorityHysteresis`, `BatterySupportMinSoc`, `BatterySupportPower`,
-`BatterySupportHysteresis`) are re-read directly from `config.ini` on every
-Auto-mode cycle (every 5s while in Auto mode) and on every mode switch -
-editing them in `config.ini` takes effect on the very next cycle, without a
-restart. An earlier version of this fork exposed these values as writable
-D-Bus paths under `/Settings/*` for VRM-based editing; this was removed after
-testing showed the Venus OS GUI (Remote Console as well as the VRM portal)
-only ever renders the fixed set of paths it already knows for the
-`evcharger` role - custom paths like these are simply not displayed anywhere,
-making that mechanism pointless in practice. Editing `config.ini` directly is
-therefore the only supported way to change these values.
+(An earlier version of this fork exposed the Auto-mode tuning values as
+writable D-Bus paths under `/Settings/*` for VRM-based editing; this was
+removed after testing showed the Venus OS GUI - Remote Console as well as
+the VRM portal - only ever renders the fixed set of paths it already knows
+for the `evcharger` role, making custom paths like these invisible anywhere.
+Editing `config.ini` directly is therefore the only supported way to change
+these values.)
 
 ## Used documentation
 

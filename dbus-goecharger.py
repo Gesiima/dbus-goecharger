@@ -74,15 +74,6 @@ class DbusGoeChargerService:
     # ~10s for the physical switch to complete) - not a soft parameter like
     # 'amp'. Tracked the same way as frc/amp to avoid redundant writes.
     self._lastCommandedPsm = None
-    # Last 'pgt' (grid target) value we ourselves commanded (None = not yet
-    # known). Previously only ever sent once, at the moment of switching TO
-    # Auto mode (_applyChargeMode()) - editing PvGridTarget in config.ini
-    # while already in Auto had no effect until the next mode switch or
-    # service restart. Tracked and re-checked every Auto-mode cycle instead,
-    # matching how other tuning values (BatteryPriorityMinSoc etc.) already
-    # apply live without a restart - only written when it actually changes.
-    self._lastCommandedPgt = None
-
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
@@ -448,7 +439,6 @@ class DbusGoeChargerService:
         self._batteryPriorityPaused = False
         self._batterySupportActive = False
         self._lastCommandedAmp = None
-        self._lastCommandedPgt = None
         # IMPORTANT (found live): the raw pGrid/pPv/pAkku fields correctly go
         # null once this fork stops pushing them (on leaving Auto), but the
         # go-e's own INTERNAL ROLLING AVERAGES of these values
@@ -639,19 +629,17 @@ class DbusGoeChargerService:
         else:
           logging.warning("Could not confirm amp ceiling at %dA - will retry next cycle" % maxAmp)
 
-      # Grid target (pgt): re-checked every Auto-mode cycle instead of only
-      # once at the moment of switching to Auto, so editing PvGridTarget in
-      # config.ini while already in Auto mode takes effect on the next cycle
-      # without needing a mode switch or service restart - matching how
-      # other tuning values (BatteryPriorityMinSoc etc.) already apply live.
-      gridTarget = self._getSetting('PvGridTarget', 0)
-      if self._lastCommandedPgt != gridTarget:
-        ok = self._setGoeChargerValueV2('pgt', gridTarget)
-        if ok:
-          logging.info("Grid target (pgt) set: %s W" % gridTarget)
-          self._lastCommandedPgt = gridTarget
-        else:
-          logging.warning("Could not set pgt to %s W - will retry next cycle" % gridTarget)
+      # Grid target (pgt) is intentionally NEVER written by this fork -
+      # configure it directly in the go-e app instead (PV surplus -> Grid
+      # target). An earlier version of this script managed pgt via
+      # config.ini, including a fairly involved "master value" mechanism to
+      # reconcile config.ini edits with direct changes in the go-e app - this
+      # added real complexity and a real bug (an app-side change could be
+      # silently reverted again on the very next cycle) for a value that is
+      # just as easy to set once, directly where it actually takes effect.
+      # The current value is still read (see the BatterySupportCompensatePgt
+      # handling below) to compensate for it when the battery buffer feature
+      # is active, but this script has no writable opinion on what it should be.
 
       # Battery priority: only release EV charging once the battery SOC has
       # reached a configured minimum threshold (similar to the evcc setting).
@@ -738,9 +726,47 @@ class DbusGoeChargerService:
             # the battery discharging. The virtual surplus is therefore added
             # to pGrid (making it more negative = more exportable surplus),
             # not to pPv.
-            pGrid -= supportPower
-            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> pGrid adjusted by -%sW virtual surplus" %
-                          (batterySocForSupport, maxSocForSupport, supportHysteresis, supportPower))
+            adjustment = supportPower
+            # Optional compensation for pgt's continuous reserve (see "The
+            # grid target (pgt) acts continuously" in the README): pgt keeps
+            # subtracting its own reserve from whatever pGrid reports,
+            # including this virtual battery-support surplus - so without
+            # compensating for it, less than the configured BatterySupportPower
+            # actually reaches the charge current calculation. Enabled via
+            # BatterySupportCompensatePgt in config.ini (default: off, to
+            # preserve existing behaviour for anyone already relying on it).
+            # pgt itself is only ever configured directly in the go-e app (see
+            # note above) - it is read here fresh, purely to inform this
+            # compensation, never written.
+            # NOTE: the exact relationship between pgt and the resulting
+            # current reduction has only been empirically observed, not
+            # precisely confirmed as a formula - this compensation is a
+            # reasonable approximation (adding pgt's magnitude), not a
+            # guaranteed exact match.
+            if self._getSetting('BatterySupportCompensatePgt', 0):
+              try:
+                pgtData = self._getGoeChargerData('pgt')
+                currentPgt = pgtData.get('pgt') if pgtData is not None else None
+              except Exception:
+                currentPgt = None
+              adjustment += abs(currentPgt) if currentPgt is not None else 0
+            pGrid -= adjustment
+            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> pGrid adjusted by -%sW virtual surplus%s" %
+                          (batterySocForSupport, maxSocForSupport, supportHysteresis, adjustment,
+                           " (incl. pgt compensation)" if adjustment != supportPower else ""))
+      elif self._batterySupportActive:
+        # IMPORTANT (found live): if the feature is disabled via config.ini
+        # (BatterySupportMinSoc or BatterySupportPower set to 0) WHILE it was
+        # previously active, the block above is skipped entirely and this
+        # flag was never being reset - it stayed stuck at True indefinitely
+        # (until leaving Auto mode entirely), even though the code that
+        # would normally re-evaluate and clear it never ran. This didn't
+        # cause a wrong pGrid adjustment (that code is also inside the
+        # skipped block), but the flag and its "active" log messages
+        # misleadingly kept implying the feature was still engaged. Reset
+        # explicitly here instead.
+        self._batterySupportActive = False
+        logging.info("Battery buffer disabled via config.ini (BatterySupportMinSoc/Power set to 0) - deactivating")
 
       # Pause/release decision for battery priority. The go-e's own Eco
       # algorithm DOES regulate the actual charge current live from
@@ -777,7 +803,7 @@ class DbusGoeChargerService:
        #get data from go-eCharger (incl. 'lmo' to detect external mode changes,
        #'modelStatus' to disambiguate WHY charging is paused, and 'err' to
        #disambiguate WHICH error occurred if car==5 - see /Status below)
-       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma,modelStatus,err,psm,pvopt_averagePGrid,pvopt_averagePPv,pvopt_averagePAkku'
+       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma,modelStatus,err,psm,pgt,pvopt_averagePGrid,pvopt_averagePPv,pvopt_averagePAkku'
        filter = baseFilter + ',lmo' if self._chargeControlEnabled else baseFilter
        data = self._getGoeChargerData(filter)
 
