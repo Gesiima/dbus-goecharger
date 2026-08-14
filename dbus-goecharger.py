@@ -587,8 +587,9 @@ class DbusGoeChargerService:
 
   def _update(self):
     try:
-       #get data from go-eCharger (incl. 'lmo' to detect external mode changes)
-       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma'
+       #get data from go-eCharger (incl. 'lmo' to detect external mode changes,
+       #and 'modelStatus' to disambiguate WHY charging is paused - see /Status below)
+       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma,modelStatus'
        filter = baseFilter + ',lmo' if self._chargeControlEnabled else baseFilter
        data = self._getGoeChargerData(filter)
 
@@ -693,14 +694,51 @@ class DbusGoeChargerService:
                 self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
 
           # carState, null if internal error (Unknown/Error=0, Idle=1, Charging=2, WaitCar=3, Complete=4, Error=5)
-          # status 0=Disconnected; 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun; 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC; 8=Ground fault; 9=Welded contacts; 10=CP Input shorted; 11=Residual current detected; 12=Under voltage detected; 13=Overvoltage detected; 14=Overheating detected
+          # Venus OS /Status (official evcharger dbus spec): 0=Disconnected;
+          # 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun;
+          # 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC;
+          # 8=Ground fault; 9=Welded contacts; 10=CP Input shorted;
+          # 11=Residual current detected; 12=Under voltage; 13=Overvoltage;
+          # 14=Overheating; 20=Charging limit.
+          #
+          # go-e's 'car' alone cannot distinguish WHY charging is paused while
+          # a vehicle is connected (car==3) - it could be insufficient PV
+          # surplus, an explicit force-off, RFID required, etc., all of which
+          # look identical from 'car' alone. go-e's 'modelStatus' (a detailed
+          # "reason why we allow charging or not" enum) is used here to pick a
+          # more specific Venus status in that case, matching the official
+          # go-e API v2 documentation:
+          # https://github.com/goecharger/go-eCharger-API-v2/blob/main/apikeys-de.md
+          #
+          # Only modelStatus 4 (NotChargingBecauseForceStateOff) and 17
+          # (NotChargingBecauseFallbackAwattar) have been directly confirmed
+          # live against this fork's own frc-driven pause states; the RFID
+          # mapping (2) is taken directly from go-e's own documentation but
+          # not separately live-tested here since this fork does not use RFID.
+          # Anything else falls back to the previous, safe generic behaviour
+          # (6 = waiting for start).
           status = 0
           if int(data['car']) == 1:
             status = 0
           elif int(data['car']) == 2:
             status = 2
           elif int(data['car']) == 3:
-            status = 6
+            modelStatus = int(data['modelStatus']) if 'modelStatus' in data and data['modelStatus'] is not None else None
+            if modelStatus == 4:
+              # Confirmed live: this is exactly the "frc=1, hard stop" state
+              # (e.g. battery priority pause) that requires acknowledgement
+              # in the go-e app ("Eco mode fortsetzen").
+              status = 6
+            elif modelStatus == 17:
+              # Confirmed live: this is the go-e's own soft pause due to
+              # insufficient PV surplus (frc=0, no external force needed) -
+              # exactly what "waiting for sun" is meant to represent.
+              status = 4
+            elif modelStatus == 2:
+              # Documented, not live-tested (this fork does not use RFID).
+              status = 5
+            else:
+              status = 6
           elif int(data['car']) == 4:
             status = 3
           self._dbusservice['/Status'] = status

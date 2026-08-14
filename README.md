@@ -44,7 +44,24 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   actual charge current live - this script does not compute a current itself,
   it only ensures `amp` (a ceiling, not the live value - see below) is raised
   to the device's maximum whenever Auto mode is entered, so the Eco algorithm
-  has its full regulation range available.
+  has its full regulation range available. **Independently confirmed** by
+  another fork of the original project,
+  [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger),
+  which does the exact same `amp = MaxCurrent` fix for the exact same reason.
+- **Detailed `/Status` reporting:** while a vehicle is connected but not
+  charging, the official Venus OS `evcharger` status enum distinguishes
+  several different reasons (e.g. `4 = waiting for sun`, `5 = waiting for
+  RFID`, `6 = waiting for start`) - `car` alone cannot tell these apart. This
+  fork additionally reads go-e's `modelStatus` (a detailed "reason why we
+  allow charging or not" enum, documented in
+  [apikeys-de.md](https://github.com/goecharger/go-eCharger-API-v2/blob/main/apikeys-de.md))
+  to pick the correct, specific Venus status - confirmed live for
+  `modelStatus 4` (`NotChargingBecauseForceStateOff`, this fork's `frc=1`
+  hard-stop states) -> Venus `6`, and `modelStatus 17`
+  (`NotChargingBecauseFallbackAwattar`, the go-e's own soft pause due to
+  insufficient PV surplus) -> Venus `4` ("waiting for sun"). See
+  `_update()` for the full mapping and which parts are live-confirmed vs.
+  taken directly from go-e's documentation without separate live testing.
 - **Scheduled mode:** activates the go-e's own "Daily Trip" mode (`lmo=5`) -
   target energy amount, target time, and tariff settings remain fully defined
   in the go-e app; this script only switches the top-level mode, exactly like
