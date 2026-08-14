@@ -134,6 +134,33 @@ the ceiling fix above.
   under a second. **`frc`** (force state: 0=Neutral, 1=Off, 2=On), set via a
   direct query parameter, reliably overrides this and is used throughout this
   fork instead of `alw` for starting/stopping charging.
+- **`frc` physically clicks the charging contactor/relay on every write**
+  (confirmed live - an audible click on the charger itself). This means `frc`
+  writes must be minimized, not just for API politeness but to avoid
+  unnecessary relay wear. Two real bugs caused by this were found and fixed,
+  and the underlying pattern was then generalized:
+  1. When entering Auto mode, the code used to unconditionally release
+     charging (`frc=0`) and only then, on the very next cycle, evaluate
+     battery priority - if the battery SOC was already below the configured
+     threshold at that moment, this caused an immediate `frc=0` followed by
+     `frc=1` (release, then re-lock within seconds) - two audible clicks for a
+     single mode switch. Fixed by evaluating battery priority *before* writing
+     any `frc` value when entering Auto mode.
+  2. When entering Manual mode, the code used to unconditionally force
+     charging off (`frc=1`) as a "safe default" - this stopped an
+     already-active charging session (e.g. one running via PV surplus in Auto
+     mode) and clicked the relay, even though the intent of switching to
+     Manual was only to hand control over to `SetCurrent`/`StartStop` going
+     forward, not to stop an ongoing charge. Fixed to use `frc=0` (neutral)
+     instead.
+  3. **Generalized fix:** every `frc` write anywhere in the script now goes
+     through a single `_setFrc()` helper, which tracks the last value
+     commanded *globally, across all modes* (`self._lastCommandedFrc`) and
+     only actually writes (and only clicks the relay) when the desired value
+     differs from that tracked value - regardless of which mode or code path
+     is asking for it. E.g. switching Auto -> Manual -> Scheduled -> Auto
+     while `frc` stays logically `0` throughout now produces zero writes and
+     zero clicks, not one per mode switch.
 - The older `/mqtt?payload=key=value` endpoint (used by the original script
   for `amp`/`alw`/`ama`) worked fine for `amp` in testing, but repeatedly and
   persistently failed for `alw` (error status/no response) - the exact cause

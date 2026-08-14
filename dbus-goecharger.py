@@ -34,9 +34,17 @@ class DbusGoeChargerService:
     self._lastCommandedLmo = None
     self._batteryPriorityPaused = False
     self._batterySupportActive = False
-    # last alw value we ourselves commanded via battery priority (None = never set).
-    # Prevents alw from being rewritten unnecessarily on every cycle (every 5s).
-    self._lastAlwCommanded = None
+    # Last 'frc' value we ourselves commanded, GLOBALLY across all modes (None
+    # = not yet known, e.g. right after service start). 'frc' physically
+    # clicks the go-e's charge contactor/relay on every write (confirmed
+    # live) - this tracker, together with _setFrc() below, ensures 'frc' is
+    # only ever written when the desired value actually differs from what we
+    # last commanded, regardless of which mode or code path is asking for it.
+    # Deliberately NOT reset on mode switches, since the goal is precisely to
+    # avoid redundant re-writes of an already-correct value across mode
+    # transitions (e.g. Auto -> Manual should not click the relay if frc was
+    # already 0 in both).
+    self._lastCommandedFrc = None
     # last amp value we ourselves commanded in Auto mode (None = never set).
     # IMPORTANT: 'amp' is written to flash on every set on API v2 hardware
     # (unlike the API v1-only 'amx' key, which does not exist on this API v2
@@ -214,6 +222,24 @@ class DbusGoeChargerService:
     return True
 
 
+  def _setFrc(self, value):
+    '''
+    Writes 'frc' (force state: 0=Neutral, 1=Off, 2=On) only if it differs
+    from the last value we ourselves commanded, tracked globally in
+    self._lastCommandedFrc across all modes. 'frc' physically clicks the
+    go-e's charge contactor/relay on every write (confirmed live) - all
+    frc writes anywhere in this script go through this method so that a
+    mode switch (or any other code path) never re-writes an already-correct
+    value and never clicks the relay unnecessarily.
+    '''
+    if self._lastCommandedFrc == value:
+      return True
+    ok = self._setGoeChargerValueV2('frc', value)
+    if ok:
+      self._lastCommandedFrc = value
+    return ok
+
+
   def _getGoeChargerData(self, filter):
     URL = "%s?filter=%s" % (self._getGoeChargerStatusUrl(), filter)
     try:
@@ -302,26 +328,27 @@ class DbusGoeChargerService:
     stable over 15+ seconds in testing, unlike alw alone.
     '''
     try:
-      # When leaving Auto mode, reset the battery-priority state and, if
-      # charging had been locked because of it, release it again - otherwise
-      # frc=1 would remain in effect and the user would not be able to
-      # charge in Manual mode.
+      # Reset Auto-mode-specific state when leaving Auto - the actual 'frc'
+      # value for the new mode is set further below via _setFrc(), which
+      # only writes (and only clicks the relay) if the value actually needs
+      # to change.
       if self._chargeMode != 1:
-        if self._lastAlwCommanded == False:
-          try:
-            self._setGoeChargerValueV2('frc', 0)
-            logging.info("Battery priority lifted (mode switch) - charging released again")
-          except Exception as e:
-            logging.warning("Could not release frc on mode switch: %s" % e)
         self._batteryPriorityPaused = False
         self._batterySupportActive = False
-        self._lastAlwCommanded = None
         self._lastCommandedAmp = None
 
       if self._chargeMode == 1:
         ok = self._setGoeChargerValueV2('lmo', 4)
         self._setGoeChargerValueV2('fup', True)
-        self._setGoeChargerValueV2('frc', 0)
+        # IMPORTANT: 'frc' is NOT set here directly (e.g. blindly to 0/release).
+        # Live testing showed the go-e's charge contactor physically clicks
+        # (relay engages/disengages) on every frc write - unconditionally
+        # releasing here and then having the very next cycle's battery
+        # priority check immediately re-lock it (if SOC is currently below
+        # the threshold) caused two clicks in quick succession. Battery
+        # priority is instead evaluated FIRST, via the call to
+        # _pushPvSurplusValues() below, so frc is written at most once with
+        # the already-correct value.
         # ROOT CAUSE FOUND (after extensive live testing): 'amp' is NOT the
         # live-regulated charge current - it is a CEILING that the go-e's Eco
         # algorithm will not exceed. The actual, live-regulated current is
@@ -361,6 +388,11 @@ class DbusGoeChargerService:
         else:
           logging.warning("Could not set lmo=4 - _lastCommandedLmo left unchanged, will retry next cycle")
         logging.info("Charge mode: Auto (PV surplus enabled)")
+        # Immediately evaluate battery priority and push PV surplus values,
+        # instead of waiting up to 5s for the next regular cycle - this is
+        # also what determines and writes the correct initial frc value (see
+        # note above).
+        self._pushPvSurplusValues()
       elif self._chargeMode == 2:
         # "Scheduled" in Venus OS activates the go-e's own "Daily Trip" mode
         # (lmo=5) - NOT the separate weekly on/off timer (sch_week etc., which
@@ -372,7 +404,7 @@ class DbusGoeChargerService:
         # mode, exactly like Auto/Manual.
         ok = self._setGoeChargerValueV2('lmo', 5)
         self._setGoeChargerValueV2('fup', False)
-        self._setGoeChargerValueV2('frc', 0)
+        self._setFrc(0)
         self._setGoeSchedulerEnabled(False)
         if ok:
           self._lastCommandedLmo = 5
@@ -380,9 +412,17 @@ class DbusGoeChargerService:
           logging.warning("Could not set lmo=5 - _lastCommandedLmo left unchanged, will retry next cycle")
         logging.info("Charge mode: Scheduled (go-e Daily Trip mode enabled - fully configured in the go-e app)")
       else:
+        # IMPORTANT: frc=0 (neutral), NOT frc=1 (force off). Neutral does not
+        # force anything - an already-active charging session (e.g. one that
+        # was running via PV surplus in Auto mode) simply continues
+        # uninterrupted, and an already-idle session simply stays idle. Using
+        # frc=1 here used to unconditionally stop an active session and click
+        # the contactor on every switch to Manual, even when the intent was
+        # only to hand control over to SetCurrent/StartStop going forward, not
+        # to stop charging.
         ok = self._setGoeChargerValueV2('lmo', 3)
         self._setGoeChargerValueV2('fup', False)
-        self._setGoeChargerValueV2('frc', 1)
+        self._setFrc(0)
         self._setGoeSchedulerEnabled(False)
         if ok:
           self._lastCommandedLmo = 3
@@ -521,20 +561,12 @@ class DbusGoeChargerService:
       # the root-cause finding about the 'amp' ceiling); the actual current
       # itself is intentionally not computed or set here.
       if self._batteryPriorityPaused:
-        if not self._lastAlwCommanded == False:
-          ok = self._setGoeChargerValueV2('frc', 1)
-          if ok:
-            self._lastAlwCommanded = False
-          else:
-            logging.warning("Could not set frc=1 - will retry next cycle")
+        if not self._setFrc(1):
+          logging.warning("Could not set frc=1 - will retry next cycle")
         return
       else:
-        if not self._lastAlwCommanded == True:
-          ok = self._setGoeChargerValueV2('frc', 0)
-          if ok:
-            self._lastAlwCommanded = True
-          else:
-            logging.warning("Could not release frc - will retry next cycle")
+        if not self._setFrc(0):
+          logging.warning("Could not release frc - will retry next cycle")
 
       payload = json.dumps({"pGrid": int(round(pGrid)), "pPv": int(round(pPv)), "pAkku": int(round(pAkku))})
       baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
@@ -717,7 +749,7 @@ class DbusGoeChargerService:
       # something dependent on 'alw'). 'alw' is therefore no longer written
       # here at all.
       enable = bool(int(value))
-      return self._setGoeChargerValueV2('frc', 0 if enable else 1)
+      return self._setFrc(0 if enable else 1)
     elif path == '/MaxCurrent':
       return self._setGoeChargerValueV2('ama', int(value))
     elif path == '/Mode':
