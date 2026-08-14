@@ -49,19 +49,37 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger),
   which does the exact same `amp = MaxCurrent` fix for the exact same reason.
 - **Detailed `/Status` reporting:** while a vehicle is connected but not
-  charging, the official Venus OS `evcharger` status enum distinguishes
-  several different reasons (e.g. `4 = waiting for sun`, `5 = waiting for
-  RFID`, `6 = waiting for start`) - `car` alone cannot tell these apart. This
-  fork additionally reads go-e's `modelStatus` (a detailed "reason why we
-  allow charging or not" enum, documented in
+  actively charging, the official Venus OS `evcharger` status enum
+  distinguishes several different reasons (e.g. `4 = waiting for sun`,
+  `5 = waiting for RFID`, `6 = waiting for start`) - `car` alone cannot tell
+  these apart. This fork additionally reads go-e's `modelStatus` (a detailed
+  "reason why we allow charging or not" enum, documented in
   [apikeys-de.md](https://github.com/goecharger/go-eCharger-API-v2/blob/main/apikeys-de.md))
-  to pick the correct, specific Venus status - confirmed live for
-  `modelStatus 4` (`NotChargingBecauseForceStateOff`, this fork's `frc=1`
-  hard-stop states) -> Venus `6`, and `modelStatus 17`
-  (`NotChargingBecauseFallbackAwattar`, the go-e's own soft pause due to
-  insufficient PV surplus) -> Venus `4` ("waiting for sun"). See
-  `_update()` for the full mapping and which parts are live-confirmed vs.
-  taken directly from go-e's documentation without separate live testing.
+  to pick the correct, specific Venus status. **Important, corrected after
+  live testing:** the disambiguation applies when go-e's `car==4`, NOT
+  `car==3` as one might assume from the official "car" state names alone - on
+  this device/firmware, go-e reports `car==4` ("charging finished, vehicle
+  still connected") for both a genuinely completed session *and* for
+  paused/force-off states. Confirmed live: `modelStatus 4`
+  (`NotChargingBecauseForceStateOff`, this fork's `frc=1` hard-stop states) ->
+  Venus `6`, and `modelStatus 17` (`NotChargingBecauseFallbackAwattar`, the
+  go-e's own soft pause due to insufficient PV surplus) -> Venus `4`
+  ("waiting for sun"); any other `modelStatus` value falls back to `car==4`'s
+  plain original meaning, "Charged" (3). See `_update()` for the full mapping
+  and which parts are live-confirmed vs. taken directly from go-e's
+  documentation without separate live testing.
+  **Also added:** `car==5` ("Error", per go-e's own docs) was previously
+  unhandled entirely and silently fell through to `/Status=0`
+  ("Disconnected"), hiding a real error behind a misleading "not connected"
+  display. go-e's separate `err` key is now used to pick the closest matching
+  Venus error status where a reasonably confident mapping exists (otherwise a
+  generic overheating/error code, still distinct from "Disconnected"). None of
+  these error-code mappings have been live-tested (no real error has occurred
+  during development) - please verify against the go-e app if this ever
+  triggers. The docs also note `car` can be `null` on an internal error, not
+  just report `5` - this is now handled defensively (`/Status=0`) instead of
+  crashing `int(None)`, which is what an earlier version of this code did in
+  the separate charging-time-tracking logic further up in `_update()`.
 - **Scheduled mode:** activates the go-e's own "Daily Trip" mode (`lmo=5`) -
   target energy amount, target time, and tariff settings remain fully defined
   in the go-e app; this script only switches the top-level mode, exactly like

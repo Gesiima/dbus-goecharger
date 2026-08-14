@@ -588,8 +588,9 @@ class DbusGoeChargerService:
   def _update(self):
     try:
        #get data from go-eCharger (incl. 'lmo' to detect external mode changes,
-       #and 'modelStatus' to disambiguate WHY charging is paused - see /Status below)
-       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma,modelStatus'
+       #'modelStatus' to disambiguate WHY charging is paused, and 'err' to
+       #disambiguate WHICH error occurred if car==5 - see /Status below)
+       baseFilter = 'nrg,eto,wh,alw,amp,ama,car,tmp,tma,modelStatus,err'
        filter = baseFilter + ',lmo' if self._chargeControlEnabled else baseFilter
        data = self._getGoeChargerData(filter)
 
@@ -647,9 +648,10 @@ class DbusGoeChargerService:
           # across PV-surplus pauses (no reset on car==4), but is lost on a restart of
           # this service (a rare edge case).
           timeDelta = time.time() - self._lastUpdate
-          if int(data['car']) == 2 and self._lastUpdate > 0:  # vehicle loads
+          carForTiming = int(data['car']) if data['car'] is not None else None
+          if carForTiming == 2 and self._lastUpdate > 0:  # vehicle loads
             self._chargingTime += timeDelta
-          elif int(data['car']) == 1:  # charging station ready, no vehicle
+          elif carForTiming == 1:  # charging station ready, no vehicle
             self._chargingTime = 0
           self._dbusservice['/ChargingTime'] = int(self._chargingTime)
           # /Session/Time - this path is read by the Venus OS GUI/VRM for the
@@ -693,7 +695,12 @@ class DbusGoeChargerService:
              else:
                 self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
 
-          # carState, null if internal error (Unknown/Error=0, Idle=1, Charging=2, WaitCar=3, Complete=4, Error=5)
+          # carState, per official go-e API v2 docs (apikeys-de.md):
+          # "null wenn interner Fehler" (Unknown/Error=0, Idle=1, Charging=2,
+          # WaitCar=3, Complete=4, Error=5). IMPORTANT: car can apparently be
+          # None/null itself on an internal error, not just report value 5 -
+          # handled defensively below instead of letting int(None) crash.
+          #
           # Venus OS /Status (official evcharger dbus spec): 0=Disconnected;
           # 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun;
           # 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC;
@@ -702,27 +709,55 @@ class DbusGoeChargerService:
           # 14=Overheating; 20=Charging limit.
           #
           # go-e's 'car' alone cannot distinguish WHY charging is paused while
-          # a vehicle is connected (car==3) - it could be insufficient PV
-          # surplus, an explicit force-off, RFID required, etc., all of which
-          # look identical from 'car' alone. go-e's 'modelStatus' (a detailed
-          # "reason why we allow charging or not" enum) is used here to pick a
-          # more specific Venus status in that case, matching the official
-          # go-e API v2 documentation:
+          # a vehicle is connected - it could be insufficient PV surplus, an
+          # explicit force-off, RFID required, or a genuinely finished
+          # session, all of which look identical from 'car' alone. go-e's
+          # 'modelStatus' (a detailed "reason why we allow charging or not"
+          # enum) is used here to pick a more specific Venus status, matching
+          # the official go-e API v2 documentation:
           # https://github.com/goecharger/go-eCharger-API-v2/blob/main/apikeys-de.md
+          #
+          # IMPORTANT (corrected after live testing): the disambiguation must
+          # be applied when car==4, NOT car==3. On this device/firmware, go-e
+          # reports car==4 ("charging finished, vehicle still connected") for
+          # BOTH a genuinely completed session AND for paused/force-off states
+          # - confirmed live: both "gestoppt" (frc=1, modelStatus=4) and "ECO
+          # pausiert" (frc=0, modelStatus=17) showed car==4, not car==3. An
+          # earlier version of this mapping applied the disambiguation to
+          # car==3 instead, which never matched these real-world pause states
+          # in practice - car==4 always fell through to a plain "Charged",
+          # which is what was seen live even while genuinely waiting for PV.
           #
           # Only modelStatus 4 (NotChargingBecauseForceStateOff) and 17
           # (NotChargingBecauseFallbackAwattar) have been directly confirmed
           # live against this fork's own frc-driven pause states; the RFID
           # mapping (2) is taken directly from go-e's own documentation but
           # not separately live-tested here since this fork does not use RFID.
-          # Anything else falls back to the previous, safe generic behaviour
-          # (6 = waiting for start).
-          status = 0
-          if int(data['car']) == 1:
+          # If modelStatus indicates none of these known pause reasons, car==4
+          # falls back to its plain, original meaning: Charged (3).
+          #
+          # car==5 (Error) was previously not handled at all - it silently
+          # fell through to the default status=0 ("Disconnected"), hiding a
+          # real error condition behind a misleading "not connected" display.
+          # go-e's separate 'err' key (documented error reasons: FiAc=1,
+          # FiDc=2, Phase=3, Overvolt=4, Overamp=5, Diode=6, PpInvalid=7,
+          # GndInvalid=8, ContactorStuck=9, ContactorMiss=10, FiUnknown=11,
+          # Unknown=12, Overtemp=13, NoComm=14) is used to pick the closest
+          # matching Venus error status where a reasonably confident mapping
+          # exists. NONE of these error mappings have been live-tested (no
+          # real error condition has occurred during development) - if this
+          # ever triggers, please verify in the go-e app that the displayed
+          # error genuinely matches, and report back if not.
+          carValue = data['car']
+          if carValue is None:
             status = 0
-          elif int(data['car']) == 2:
+          elif int(carValue) == 1:
+            status = 0
+          elif int(carValue) == 2:
             status = 2
-          elif int(data['car']) == 3:
+          elif int(carValue) == 3:
+            status = 6
+          elif int(carValue) == 4:
             modelStatus = int(data['modelStatus']) if 'modelStatus' in data and data['modelStatus'] is not None else None
             if modelStatus == 4:
               # Confirmed live: this is exactly the "frc=1, hard stop" state
@@ -738,9 +773,28 @@ class DbusGoeChargerService:
               # Documented, not live-tested (this fork does not use RFID).
               status = 5
             else:
-              status = 6
-          elif int(data['car']) == 4:
-            status = 3
+              # No known pause reason matched - genuinely finished/charged.
+              status = 3
+          elif int(carValue) == 5:
+            errValue = int(data['err']) if 'err' in data and data['err'] is not None else None
+            if errValue == 8:
+              status = 8   # GndInvalid -> Ground fault
+            elif errValue == 9:
+              status = 9   # ContactorStuck -> Welded contacts
+            elif errValue == 1:
+              status = 11  # FiAc (RCD) -> Residual current detected
+            elif errValue == 4:
+              status = 13  # Overvolt -> Overvoltage
+            elif errValue == 13:
+              status = 14  # Overtemp -> Overheating
+            else:
+              # No confident specific mapping for this err value - still
+              # correctly signals SOME error rather than "Disconnected".
+              # Closest generic fit in the Venus enum without a dedicated
+              # "unspecified error" code.
+              status = 14
+          else:
+            status = 0
           self._dbusservice['/Status'] = status
 
           #logging
