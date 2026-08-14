@@ -48,6 +48,27 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   another fork of the original project,
   [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger),
   which does the exact same `amp = MaxCurrent` fix for the exact same reason.
+  **PV production reading:** `pPv` sums `/Ac/PvOnGrid/Total/Power`
+  (AC-coupled, already aggregated across all present phases by
+  `dbus-systemcalc-py` - reading a single phase directly, as an earlier
+  version of this fork did, would silently miss production on any other
+  phase for a multi-phase AC-coupled installation) and `/Dc/Pv/Power`
+  (DC-coupled via solar chargers, inherently system-wide/phase-agnostic
+  already).
+  **`pGrid` reading:** no equivalent aggregated "Total" path could be
+  confirmed for `/Ac/Grid/*` (unlike `/Ac/PvOnGrid/Total/Power` above), so
+  `L1`/`L2`/`L3` are read and summed explicitly (`L1` required, `L2`/`L3`
+  optional and contributing `0` if not present - e.g. a genuinely
+  single-phase connection). This matters specifically whenever the grid
+  **connection point** itself is three-phase, even if only one phase is
+  actually managed by a single-phase Multiplus/inverter (this fork's actual
+  setup: three-phase grid supply, single-phase Multiplus-II GX on L1 only) -
+  load or PV/battery-driven feed-in on the other two phases is otherwise
+  invisible to `pGrid` entirely, even though it directly affects true grid
+  import/export and therefore the go-e's surplus decision. An earlier version
+  of this fork read only `L1` for `pGrid`, matching
+  [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger)'s
+  explicit `L1+L2+L3` summing for PV but missing the same treatment for grid.
 - **Detailed `/Status` reporting:** while a vehicle is connected but not
   actively charging, the official Venus OS `evcharger` status enum
   distinguishes several different reasons (e.g. `4 = waiting for sun`,

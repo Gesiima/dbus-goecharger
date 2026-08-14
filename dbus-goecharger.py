@@ -131,14 +131,31 @@ class DbusGoeChargerService:
     # and does not register a service.
     systemBus = dbus.SystemBus()
     try:
-      self._gridPowerItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L1/Power')
-      self._pvPowerAcItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/PvOnGrid/L1/Power')
+      # pGrid: no equivalent aggregated "Total" path could be confirmed for
+      # /Ac/Grid/* (unlike /Ac/PvOnGrid/Total/Power below) - L1/L2/L3 are
+      # therefore read and summed explicitly. This matters whenever the grid
+      # CONNECTION POINT itself is three-phase (a proper multi-phase grid
+      # meter measuring all three phases), even if only one phase is actually
+      # managed by a single-phase Multiplus/inverter - load or generation on
+      # the other two phases would otherwise be invisible to pGrid entirely,
+      # even though it directly affects real grid import/export.
+      self._gridPowerItemL1 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L1/Power')
+      self._gridPowerItemL2 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L2/Power')
+      self._gridPowerItemL3 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L3/Power')
+      # /Ac/PvOnGrid/Total/Power (published by dbus-systemcalc-py) already
+      # sums all present AC phases (L1/L2/L3) - used instead of reading a
+      # single phase directly, so additional AC-coupled PV phases (e.g. an
+      # L3 installation added later) are automatically included without any
+      # code change here.
+      self._pvPowerAcItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/PvOnGrid/Total/Power')
       self._pvPowerDcItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Dc/Pv/Power')
       self._batteryPowerItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Dc/Battery/Power')
       self._batterySocItem = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Dc/Battery/Soc')
     except Exception as e:
       logging.critical('Error at %s', 'reading Venus system dbus items for Auto mode', exc_info=e)
-      self._gridPowerItem = None
+      self._gridPowerItemL1 = None
+      self._gridPowerItemL2 = None
+      self._gridPowerItemL3 = None
       self._pvPowerAcItem = None
       self._pvPowerDcItem = None
       self._batteryPowerItem = None
@@ -449,7 +466,7 @@ class DbusGoeChargerService:
              battery actually charge when /Dc/Battery/Power is positive?) and
              adjust the sign below if it does not match.
     '''
-    if self._gridPowerItem is None:
+    if self._gridPowerItemL1 is None:
       return
 
     try:
@@ -502,12 +519,21 @@ class DbusGoeChargerService:
             logging.debug("Auto mode: battery SOC %s%% < %s%% - EV charging should pause (battery priority)" %
                           (batterySoc, minBatterySoc))
 
-      gridPower = self._gridPowerItem.get_value()
+      # gridPower: summed explicitly across L1/L2/L3 (see __init__ comment) -
+      # important for a three-phase grid CONNECTION POINT even when only one
+      # phase is managed by a single-phase Multiplus/inverter, so load or
+      # generation on the other phases is not silently missed. L1 is treated
+      # as required (checked above); L2/L3 are optional and simply contribute
+      # 0 if not present/available (e.g. a genuinely single-phase connection).
+      gridPowerL1 = self._gridPowerItemL1.get_value()
+      gridPowerL2 = self._gridPowerItemL2.get_value() if self._gridPowerItemL2 is not None else None
+      gridPowerL3 = self._gridPowerItemL3.get_value() if self._gridPowerItemL3 is not None else None
+      gridPower = (gridPowerL1 or 0) + (gridPowerL2 or 0) + (gridPowerL3 or 0)
       pvPowerAc = self._pvPowerAcItem.get_value()
       pvPowerDc = self._pvPowerDcItem.get_value()
       batteryPower = self._batteryPowerItem.get_value()
 
-      if gridPower is None or batteryPower is None:
+      if gridPowerL1 is None or batteryPower is None:
         logging.warning("Auto mode: /Ac/Grid/L1/Power or /Dc/Battery/Power not available - PV push skipped this cycle")
         return
 
