@@ -69,10 +69,12 @@ if [ -f "$CONFIG_FILE" ]; then
 fi
 HOST=${HOST:-192.168.2.36}
 
-BATTERY_PRIORITY_MINSOC=$(get_ini_value "BatteryPriorityMinSoc" "0")
-BATTERY_PRIORITY_HYST=$(get_ini_value "BatteryPriorityHysteresis" "2")
-BATTERY_SUPPORT_MINSOC=$(get_ini_value "BatterySupportMinSoc" "0")
-BATTERY_SUPPORT_HYST=$(get_ini_value "BatterySupportHysteresis" "2")
+# NOTE: the BatteryPriority*/BatterySupport* values are deliberately NOT read
+# here - they are read fresh inside fetch_and_print() on every refresh, so
+# that editing config.ini while ./pvcheck.sh -w is running is reflected in the
+# very next output line. The main script re-reads these values live too (no
+# restart needed), so reading them once at startup here would show stale
+# thresholds that no longer match what the service is actually applying.
 
 FILTER="car,modelStatus,psm,err,pgrid,ppv,pakku,pvopt_averagePGrid,pvopt_averagePPv,pvopt_averagePAkku,nrg"
 
@@ -217,7 +219,15 @@ fetch_and_print() {
   if command -v dbus >/dev/null 2>&1; then
     soc=$(dbus -y com.victronenergy.system /Dc/Battery/Soc GetValue 2>/dev/null)
   fi
-  echo "$json" | python3 "$PYHELPER" "$soc" "$BATTERY_PRIORITY_MINSOC" "$BATTERY_PRIORITY_HYST" "$BATTERY_SUPPORT_MINSOC" "$BATTERY_SUPPORT_HYST"
+  # Thresholds are read fresh on every refresh (not once at startup), so that
+  # editing config.ini while -w is running shows up in the next output line -
+  # matching the main script, which also applies these live without a restart.
+  local prioMinSoc prioHyst supportMinSoc supportHyst
+  prioMinSoc=$(get_ini_value "BatteryPriorityMinSoc" "0")
+  prioHyst=$(get_ini_value "BatteryPriorityHysteresis" "2")
+  supportMinSoc=$(get_ini_value "BatterySupportMinSoc" "0")
+  supportHyst=$(get_ini_value "BatterySupportHysteresis" "2")
+  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst"
 }
 
 if [ "$1" == "-w" ]; then

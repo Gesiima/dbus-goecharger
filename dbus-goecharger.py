@@ -6,17 +6,15 @@ import logging
 from logging.handlers import RotatingFileHandler
 import sys
 import os
-import sys
-if sys.version_info.major == 2:
-    import gobject
-else:
-    from gi.repository import GLib as gobject
-import sys
 import time
 import requests # for http GET
 import configparser # for config/ini file
 import json
 import dbus
+if sys.version_info.major == 2:
+    import gobject
+else:
+    from gi.repository import GLib as gobject
 
 # our own packages from victron
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
@@ -103,14 +101,31 @@ class DbusGoeChargerService:
     self._dbusservice.add_path('/ProductId', 0xFFFF) #
     self._dbusservice.add_path('/ProductName', productname)
     self._dbusservice.add_path('/CustomName', productname)
+    # IMPORTANT: these two paths are registered unconditionally, even if the
+    # go-e was unreachable at startup (data is None). D-Bus paths can only be
+    # added before the service is registered - if they were skipped here, they
+    # would be missing for the entire lifetime of the process, even once the
+    # charger comes back. This matters in practice for a mobile wallbox that
+    # isn't always on the same network as the GX device: the service would
+    # otherwise silently come up permanently missing its firmware/serial
+    # entries, purely depending on whether the charger happened to answer
+    # during those first few hundred milliseconds. Placeholder values are used
+    # when unavailable; the fields are informational only.
+    fwv = 0
+    serial = 'unknown'
     if data:
-       fwv = data['fwv']
+       fwv = data.get('fwv', 0)
        try:
-           fwv = int(data['fwv'].replace('.', ''))
-       except:
+           fwv = int(str(data['fwv']).replace('.', ''))
+       except (KeyError, TypeError, ValueError):
+           # Keep the raw value - some firmware versions may not be numeric.
            pass
-       self._dbusservice.add_path('/FirmwareVersion', fwv)
-       self._dbusservice.add_path('/Serial', data['sse'])
+       serial = data.get('sse', 'unknown')
+    else:
+       logging.warning("go-eCharger not reachable at startup - /FirmwareVersion and /Serial "
+                       "registered with placeholder values (D-Bus paths cannot be added later)")
+    self._dbusservice.add_path('/FirmwareVersion', fwv)
+    self._dbusservice.add_path('/Serial', serial)
     self._dbusservice.add_path('/HardwareVersion', hardwareVersion)
     self._dbusservice.add_path('/Connected', 1)
     self._dbusservice.add_path('/UpdateIndex', 0)
@@ -372,9 +387,22 @@ class DbusGoeChargerService:
     or mode switch - no service restart required for these tuning values.
     (Only DEFAULT/ONPREMISE keys read at service startup, such as
     Deviceinstance or Host, still require a restart to take effect.)
+
+    Returns the default (and logs a warning) if the value cannot be parsed as
+    an integer, instead of raising. Since config.ini is re-read live on every
+    cycle, a single typo while editing it (e.g. writing "true" instead of "1",
+    or a stray character) would otherwise raise ValueError on every single
+    cycle from then on - this happened during development and is very easy to
+    trigger accidentally while tuning values on a running system.
     '''
     config = self._getConfig()
-    return int(config['DEFAULT'].get(name, default))
+    raw = config['DEFAULT'].get(name, default)
+    try:
+      return int(raw)
+    except (TypeError, ValueError):
+      logging.warning("config.ini: '%s = %s' is not a valid integer - using default %s instead" %
+                      (name, raw, default))
+      return int(default)
 
 
   def _setGoeSchedulerEnabled(self, enabled):
@@ -1093,7 +1121,18 @@ class DbusGoeChargerService:
     logging.info("someone else updated %s to %s" % (path, value))
 
     if path == '/SetCurrent':
-      return self._setGoeChargerValueV2('amp', int(value))
+      # IMPORTANT: this also has to update _lastCommandedAmp, because it writes
+      # the very same 'amp' key that the Auto-mode ceiling logic manages (see
+      # _pushPvSurplusValues). Without this, changing the current in the Venus
+      # OS GUI while in Auto mode would silently lower the ceiling, while the
+      # ceiling logic still believed 'amp' was at the device maximum and
+      # therefore never restored it - leaving the Eco algorithm permanently
+      # capped at whatever was set here. Keeping the tracker in sync means the
+      # next Auto cycle notices the discrepancy and raises the ceiling again.
+      ok = self._setGoeChargerValueV2('amp', int(value))
+      if ok:
+        self._lastCommandedAmp = int(value)
+      return ok
     elif path == '/StartStop':
       # NOTE: writing 'alw' directly via a plain query parameter returns
       # HTTP 500 ("tried to set api key without setter") - the same error
@@ -1152,7 +1191,19 @@ def main():
                             datefmt='%Y-%m-%d %H:%M:%S',
                             level=logging_level,
                             handlers=[
-                                RotatingFileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__))), maxBytes=10000),
+                                # backupCount is REQUIRED for rotation to
+                                # actually happen: with maxBytes set but
+                                # backupCount at its default of 0, Python's
+                                # RotatingFileHandler never rotates at all and
+                                # the file grows without limit (verified: a
+                                # 1000-byte limit produced a 25kB file). On a
+                                # space-constrained GX device running at
+                                # Logging=DEBUG with a 5s poll interval, that
+                                # adds up. maxBytes also raised from the
+                                # original 10kB, which is small enough that
+                                # useful context scrolls out of the log within
+                                # a minute or two at DEBUG level.
+                                RotatingFileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__))), maxBytes=2000000, backupCount=3),
                                 logging.StreamHandler()
                             ])
 

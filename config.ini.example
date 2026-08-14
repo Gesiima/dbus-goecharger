@@ -1,5 +1,10 @@
 [DEFAULT]
 ; Full explanation of every option below: see "Configuration reference" in README.md
+; These are the values from a real, working installation (single-phase
+; Multiplus-II GX on a three-phase grid connection, AC- and DC-coupled PV,
+; go-e V4). Note that BatterySupportCompensatePgt and AutoStartMode are set
+; to non-default values here - see the README for what each one does before
+; copying them as-is.
 
 ; --- Basic (unchanged from the original) ---
 AccessType = OnPremise
@@ -20,10 +25,12 @@ BatteryPriorityHysteresis = 2
 BatterySupportMinSoc = 90
 BatterySupportPower = 2500
 BatterySupportHysteresis = 2
-BatterySupportCompensatePgt = 0
+; 1 = compensate for the go-e app's grid target (pgt); default is 0
+BatterySupportCompensatePgt = 1
 
 ; --- /AutoStart button function (restart required after changing) ---
-AutoStartMode = 1
+; 3 = "1P-3P" (Off = force 1-phase, On = force 3-phase); default is 1 ("1P-Auto")
+AutoStartMode = 3
 
 [ONPREMISE]
 Host = 192.168.2.36

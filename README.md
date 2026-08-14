@@ -404,6 +404,45 @@ below the 6-second watchdog threshold (recommended: 5000ms, as in the
 original), so that a single delayed HTTP request does not already trigger an
 unwanted pause.
 
+### Findings from a full code review
+
+These were found by systematically reviewing the whole script rather than by
+hitting them in practice - three of them are latent bugs that would have been
+awkward to diagnose in the field.
+
+- **`/SetCurrent` silently defeated the `amp` ceiling logic.** `/SetCurrent`
+  writes the same `amp` key that the Auto-mode ceiling logic manages, but did
+  so without updating `self._lastCommandedAmp`. Changing the charge current
+  in the Venus OS GUI while in Auto mode therefore lowered the ceiling, while
+  the ceiling logic still believed `amp` was at the device maximum and so
+  never restored it - re-introducing exactly the capped-Eco-algorithm problem
+  described above, but silently and permanently. Verified reproducible, and
+  fixed by keeping the tracker in sync.
+- **A single config.ini typo could break every cycle.** `_getSetting()`
+  called `int()` unguarded, so writing e.g. `true` instead of `1` (easy to do
+  - and it happened during development) raised `ValueError` on every
+  subsequent cycle, since config.ini is re-read live. Now logs a warning and
+  falls back to the default instead.
+- **Log rotation was silently disabled.** `RotatingFileHandler` was given
+  `maxBytes` but no `backupCount`; with `backupCount` at its default of `0`,
+  Python never rotates at all and the file grows unbounded (verified: a
+  1000-byte limit produced a 25kB file). Relevant on a space-constrained GX
+  device at `Logging=DEBUG` with a 5s poll interval. Fixed by adding
+  `backupCount=3`, and raising `maxBytes` from 10kB (small enough that useful
+  context scrolled out of the log within a minute or two at DEBUG level) to
+  2MB.
+- **`/FirmwareVersion` and `/Serial` could be missing for the whole session.**
+  Both were only registered if the go-e answered during the first few hundred
+  milliseconds of startup. D-Bus paths can only be added before the service
+  is registered, so if the charger was unreachable at that moment they were
+  absent for the entire lifetime of the process, even after it came back -
+  a realistic scenario for a mobile wallbox that isn't always on the GX
+  device's network. Now always registered, with placeholder values and a
+  warning when unavailable.
+- Also cleaned up: `import sys` appeared three times (inherited from the
+  original), and a bare `except:` was narrowed to the exceptions it actually
+  needs to catch.
+
 ### Battery buffer flag could get stuck "active" if disabled mid-session
 
 **Found live:** if `BatterySupportMinSoc` (or `BatterySupportPower`) was
