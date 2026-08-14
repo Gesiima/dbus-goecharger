@@ -28,8 +28,60 @@ sharing the knowledge:
   display - `/ChargingTime` alone (the only thing the original sets) is marked
   deprecated in the official Victron docs and is no longer used by the GUI for
   the session display.
+- **`/Connected` now reflects actual reachability.** The original (and this
+  fork, until now) only ever set `/Connected = 1` once at startup and never
+  updated it again. If the go-e becomes unreachable (e.g. a mobile wallbox
+  currently on a different network, or a temporary WiFi/connectivity issue),
+  `_getGoeChargerData()` already handled this gracefully (returns `None`,
+  logged at DEBUG, no crash) - but every dbus path simply kept showing its
+  last known value forever, with no indication to Venus OS/VRM that the
+  device was actually gone. `/Connected` is now set to `0` (and `/Status` to
+  `0`, "Disconnected", instead of staying frozen on a stale value like
+  "Charging") as soon as a poll cycle fails, and back to `1` as soon as the
+  go-e responds again - both only written when the value actually changes.
 
-### New, optional features (via `EnableChargeControl = true` in `config.ini`)
+### `/AutoStart` repurposed as a manual phase-switching override (always active, independent of `EnableChargeControl`)
+
+Like `/StartStop` and `/SetCurrent`, this works regardless of the
+`EnableChargeControl` setting - it is not part of the "optional features"
+list below.
+
+Victron's official `evcharger` dbus spec documents `/AutoStart` as "start
+automatically when a vehicle is connected" - a concept the go-e has no direct
+equivalent for (see the discussion that led to this decision for the reasoning
+why no clean 1:1 mapping exists). Since this path is otherwise permanently
+non-functional (neither the original script nor this fork historically wrote
+anything to it, leaving the GUI button greyed out with nothing behind it), it
+is deliberately **repurposed** here for something genuinely useful instead:
+manual override of go-e's phase-switching logic (`psm`).
+
+- `/AutoStart = 1` -> `psm = 0` (**Auto** - go-e's own live, surplus-based
+  1-/3-phase switching; the normal/default state)
+- `/AutoStart = 0` -> `psm = 1` (**force single-phase**, overriding Auto)
+
+`psm = 2` (force 3-phase) is deliberately never written by this toggle -
+Auto already switches to 3-phase automatically whenever surplus allows it, so
+a permanent 3-phase force would only remove that adaptability without any
+upside for a simple two-state button.
+
+**Important caveat, by direct analogy with the `frc` relay-click findings
+above:** phase switching is documented and reported by other users to
+involve a real, timed contactor changeover (~10s to complete), not a soft
+parameter - so this control goes through the same "only write if the value
+actually changed" tracking (`_setPsm()`/`self._lastCommandedPsm`) as `frc`
+does, to avoid unnecessary physical switching. **Confirmed live** that the
+`/AutoStart` toggle correctly forces single-phase charging via the go-e app.
+
+**External change detection:** if `psm` is changed directly in the go-e app
+instead of via the Venus OS `/AutoStart` toggle, this is now detected the
+same way external `lmo` changes are (see `/Mode` above) and `/AutoStart` is
+updated to match - `psm=1` (forced 1-phase) -> `/AutoStart=0`, anything else
+(`0`=Auto or `2`=forced 3-phase, the latter never written by this fork's own
+toggle but settable directly in the app) -> `/AutoStart=1`. This runs
+independently of `EnableChargeControl`, matching `/AutoStart`'s own
+independence from that setting (like `/StartStop`/`/SetCurrent`).
+
+
 
 Everything below is **disabled by default**. Without this setting, the script
 behaves exactly like the original - monitoring only, `/Mode` stays read-only.
@@ -48,15 +100,28 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   another fork of the original project,
   [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger),
   which does the exact same `amp = MaxCurrent` fix for the exact same reason.
-  **PV production reading:** `pPv` sums `/Ac/PvOnGrid/Total/Power`
-  (AC-coupled, already aggregated across all present phases by
-  `dbus-systemcalc-py` - reading a single phase directly, as an earlier
-  version of this fork did, would silently miss production on any other
-  phase for a multi-phase AC-coupled installation) and `/Dc/Pv/Power`
+  **PV production reading:** `pPv` sums AC-coupled production
+  (`/Ac/PvOnGrid/L1/Power` + `L2` + `L3`, explicitly, `L1` required and
+  `L2`/`L3` optional/contributing `0` if not present) and `/Dc/Pv/Power`
   (DC-coupled via solar chargers, inherently system-wide/phase-agnostic
-  already).
-  **`pGrid` reading:** no equivalent aggregated "Total" path could be
-  confirmed for `/Ac/Grid/*` (unlike `/Ac/PvOnGrid/Total/Power` above), so
+  already). **Corrected after live testing:** an earlier version used
+  `/Ac/PvOnGrid/Total/Power` (an aggregate that looked like it should exist,
+  published by `dbus-systemcalc-py` on some systems) instead of explicit
+  `L1`/`L2`/`L3` summing - this path does **not** exist on this system
+  (confirmed live: `dbus -y com.victronenergy.system
+  /Ac/PvOnGrid/Total/Power GetValue` failed with an `AttributeError` from the
+  dbus CLI itself, i.e. no such object). This silently degraded to `0` via
+  this fork's own `_safeGetValue()` defensive handling (see below) - not a
+  crash, but a real, unnoticed loss of the *entire* AC-coupled contribution
+  to `pPv` for as long as that version ran (confirmed live: ~1700W of real
+  AC-coupled production was missing, leaving only the ~650W DC-coupled
+  portion, which happened to look plausible enough on its own to not be
+  immediately obviously wrong). Reverted to explicit `L1`/`L2`/`L3` summing,
+  matching the approach already used for `pGrid` below - this cannot silently
+  drop an entire generation source the way relying on an unconfirmed
+  "shortcut" aggregate path did.
+  **`pGrid` reading:** no equivalent aggregated "Total" path was ever assumed
+  for `/Ac/Grid/*` (this mistake was specific to the PV path above), so
   `L1`/`L2`/`L3` are read and summed explicitly (`L1` required, `L2`/`L3`
   optional and contributing `0` if not present - e.g. a genuinely
   single-phase connection). This matters specifically whenever the grid
@@ -69,6 +134,20 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   of this fork read only `L1` for `pGrid`, matching
   [gonzo7734/dbus-goecharger](https://github.com/gonzo7734/dbus-goecharger)'s
   explicit `L1+L2+L3` summing for PV but missing the same treatment for grid.
+  **Critical bug found and fixed shortly after adding the L2/L3/Total reads
+  above:** a `dbus.exceptions.DBusException` ("was not provided by any
+  .service files") from `com.victronenergy.system` at the moment of an
+  actual `.get_value()` call - not just at `VeDbusItemImport` construction
+  time, which was already wrapped in `try`/`except` - crashed the entire
+  service. This can happen if the underlying Venus system service is
+  momentarily unavailable (e.g. during its own restart) or, for a newly added
+  path specifically, if that exact path isn't served on a given Venus OS
+  version/configuration. Every read of a Venus system item now goes through
+  a dedicated `_safeGetValue()` wrapper instead of calling `.get_value()`
+  directly, so any single missing/unavailable value degrades gracefully
+  (treated the same as if the item were `None`) instead of taking down the
+  whole process. Confirmed via the automated test suite by simulating a
+  raising `.get_value()` on every affected item simultaneously.
 - **Detailed `/Status` reporting:** while a vehicle is connected but not
   actively charging, the official Venus OS `evcharger` status enum
   distinguishes several different reasons (e.g. `4 = waiting for sun`,
@@ -207,8 +286,19 @@ the ceiling fix above.
      already-active charging session (e.g. one running via PV surplus in Auto
      mode) and clicked the relay, even though the intent of switching to
      Manual was only to hand control over to `SetCurrent`/`StartStop` going
-     forward, not to stop an ongoing charge. Fixed to use `frc=0` (neutral)
-     instead.
+     forward, not to stop an ongoing charge. First fixed by unconditionally
+     using `frc=0` (neutral) instead - but this created a *different* problem:
+     Basic mode (`lmo=3`) has no PV-surplus gating logic of its own, so
+     `frc=0` makes it start charging immediately at the full `amp` ceiling
+     the moment a vehicle is connected, regardless of whether it was actually
+     charging right before the switch. Switching Auto -> Manual while Auto
+     happened to be paused (e.g. insufficient PV surplus) would therefore
+     unexpectedly start a manual charge - the opposite of the common intent
+     of "just turn Auto off". **Corrected again:** the go-e's actual `car`
+     state is now checked right before switching to Manual - only if it shows
+     `2` (actively charging) does `frc` stay at `0` (continue seamlessly);
+     otherwise `frc=1` is used, taking over whatever state was genuinely
+     active at that moment instead of always releasing.
   3. **Generalized fix:** every `frc` write anywhere in the script now goes
      through a single `_setFrc()` helper, which tracks the last value
      commanded *globally, across all modes* (`self._lastCommandedFrc`) and
@@ -246,6 +336,36 @@ the ceiling fix above.
   chargers) - `amp` can simply be used directly on API v2, exactly as
   [evcc's own source code does](https://github.com/evcc-io/evcc/blob/main/charger/go-e.go).
 
+### HTTP connection handling (tried Session reuse, reverted)
+
+A shared `requests.Session()` was tried for all go-e API calls, instead of
+plain module-level `requests.get(...)` calls (which each internally create a
+brand new `Session`, and therefore a brand new TCP connection, every single
+time). The intent was connection reuse (HTTP keep-alive), to avoid repeatedly
+doing a full TCP handshake against the go-e's small, resource-constrained
+ESP32 web server. **Confirmed live, though: the go-e closes the underlying
+socket after every single response without declaring `Connection: close` in
+its own response headers** - so `urllib3`'s connection pool doesn't know the
+connection is already dead, attempts to reuse it anyway, discovers the drop,
+and only then opens a fresh connection (logged as `"Resetting dropped
+connection"` instead of the plain `"Starting new HTTP connection"` seen
+without a shared session). This is strictly *worse* than immediately opening
+a fresh connection, since it adds a doomed reuse attempt first.
+
+An explicit `Connection: close` header was then added as a default on the
+session, expecting this to stop the pool from attempting reuse at all.
+**Confirmed live that this did not work either** - `"Resetting dropped
+connection"` still appeared on every single call afterwards. This request
+header only asks the *server* to close the connection; it does not reliably
+prevent this client's own connection pool from still attempting to reuse an
+already-pooled connection from an earlier call.
+
+**Reverted entirely** back to plain module-level `requests.get(...)` calls
+everywhere - confirmed to not exhibit the "attempt reuse, discover dead,
+reconnect" pattern at all, at the cost of not attempting keep-alive (which
+was irrelevant anyway, since the go-e doesn't support it reliably in the
+first place).
+
 ### Timing behaviour (PV surplus push)
 
 Measured while continuously sending `pGrid`/`pPv`/`pAkku` every 5 seconds:
@@ -270,6 +390,57 @@ below the 6-second watchdog threshold (recommended: 5000ms, as in the
 original), so that a single delayed HTTP request does not already trigger an
 unwanted pause.
 
+### Fresh PV data is pushed *before* activating Eco mode, not after
+
+**Found live:** switching Auto (charging on genuine surplus) -> Manual
+(continues charging, per the `frc` fix above) -> Auto again later, once it
+had actually gone dark, caused the go-e to immediately resume charging as if
+the old surplus still applied. The go-e appears to keep its last-received
+`pGrid`/`pPv`/`pAkku` values around indefinitely while `lmo != 4` (Eco isn't
+evaluating them while inactive, so there is nothing to invalidate the old
+reading) and then acts on whatever it has stored the instant Eco
+re-activates. If `lmo` is set to `4` first and a fresh push follows moments
+later (the previous order), there is a brief window where Eco could start
+evaluating using the old, possibly many-minutes-stale surplus value instead
+of the current one. **Fixed** by reordering `_applyChargeMode()`'s Auto
+branch to push fresh `pGrid`/`pPv`/`pAkku` *before* setting `lmo=4` - by the
+time Eco mode actually activates, the most current real reading is already
+the "last known" value for it to act on, closing the window entirely.
+
+**Further finding, after the above fix alone turned out to be insufficient:**
+a single fresh push at the moment of re-entering Auto did not fully prevent
+resuming as if old surplus still applied. Checking `pvopt_averagePGrid`,
+`pvopt_averagePPv`, and `pvopt_averagePAkku` (internal rolling averages,
+undocumented but readable via `/api/status`) while in Manual revealed why:
+these stay frozen at their last computed value indefinitely - confirmed
+live, `pgrid`/`ppv`/`pakku` (the raw instantaneous fields) correctly went
+`null` once this fork stopped pushing them, but the `pvopt_average*` fields
+did not, and appear to be what the Eco algorithm's start/stop and
+phase-switch decisions are actually driven by, rather than the raw
+instantaneous values. A single fresh sample upon re-entering Auto cannot
+immediately override several minutes of accumulated average. **Fixed**: a
+one-time `{"pGrid":0,"pPv":0,"pAkku":0}` reset push is now sent when Auto is
+*left* (entering Manual or Scheduled), so the stored averages start decaying
+towards "no known surplus" for the duration of the time spent outside Auto,
+instead of staying frozen on stale, possibly much higher surplus data
+indefinitely.
+
+### Phase-switch anti-flapping lock (`mptwt`) can cause a stop/start loop
+
+Not fixed/handled by this fork, but worth understanding: the go-e has a
+minimum phase-toggle wait time (community-documented key `mptwt`, reportedly
+600s/10 minutes by default) that prevents switching between 1-phase and
+3-phase more often than this interval, regardless of current `pGrid`/`pPv`.
+If the go-e switches to 3-phase while genuine surplus exists and conditions
+then drop below what 3-phase's minimum current requires before this lockout
+expires, it cannot fall back to 1-phase - the home battery may then be drawn
+on to sustain the current 3-phase session (real load: real PV production, no
+override needed here to explain it), and once that stops being sustainable
+the go-e may stop, briefly retry (still locked to 3-phase), stop again,
+repeating in a stop/start cycle without ever reaching 1-phase until the
+lockout window elapses. This is inherent go-e firmware behaviour, not
+something this fork's PV surplus push can influence.
+
 ### The grid target (`pgt`) acts continuously
 
 `pgt` is a persistent config value and continuously feeds into the Eco mode's
@@ -280,6 +451,16 @@ as a buffer before the resulting charge current (rounded down to whole amps)
 is calculated. (This test predates the `amp`-ceiling discovery above and was
 incidentally not affected by it, since 6A happened to be at/below whatever
 ceiling was in effect at the time.)
+
+**Fixed: `PvGridTarget` config edits now apply live, without a restart.**
+`pgt` used to be sent to the go-e only once, at the exact moment of switching
+*to* Auto mode (`_applyChargeMode()`) - editing `PvGridTarget` in `config.ini`
+while already in Auto mode had no effect until the next mode switch or
+service restart, unlike other tuning values (`BatteryPriorityMinSoc` etc.)
+which are already re-read from `config.ini` every cycle. `pgt` is now
+re-checked every Auto-mode cycle the same way (tracked via
+`self._lastCommandedPgt`, only written when it actually changes) - a
+`config.ini` edit now takes effect on the very next cycle.
 
 ## Restrictions
 
@@ -294,6 +475,24 @@ Venus OS automatic mode.
 
 Phase switching (1/3-phase) is deliberately left to the go-e's own firmware
 logic (`psm`, `spl3`) and is not manipulated by this script.
+
+### Visible startup confirmation even at `Logging = WARN`
+
+At `Logging = WARN`, essentially all startup logging (`INFO`/`DEBUG` level)
+is filtered out - a restarted service left no confirmation in the log that
+it had actually started successfully. One line is now logged at `WARNING`
+level specifically so it remains visible regardless of the configured level:
+`"dbus-goecharger started successfully..."`, logged once right after
+registering on D-Bus and switching to the event loop.
+
+**Note:** a periodic one-line heartbeat at `WARNING` level (logged every
+`SignOfLifeLog` minutes) was tried as well, but reverted - `WARNING` is
+meant for something actually noteworthy, not routine "still running"
+confirmation, so continuously repeating it there would be a misuse of the
+log level's meaning purely to force visibility. The existing multi-line
+`INFO`-level sign-of-life block (`_signOfLife()`) is unchanged; switch
+`Logging` to `INFO` or `DEBUG` temporarily if periodic confirmation is
+needed beyond the one-time startup line.
 
 ## Install & Configuration
 
