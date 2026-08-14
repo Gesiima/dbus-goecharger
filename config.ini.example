@@ -28,8 +28,12 @@ BatterySupportHysteresis = 2
 ; 1 = compensate for the go-e app's grid target (pgt); default is 0
 BatterySupportCompensatePgt = 1
 
+; --- Rolling-average reset after leaving Auto mode ---
+; 0 = disabled; default is 5
+PvAverageResetCycles = 5
+
 ; --- /AutoStart button function (restart required after changing) ---
-; 3 = "1P-3P" (Off = force 1-phase, On = force 3-phase); default is 1 ("1P-Auto")
+; 3 = "1P-3P" (Off = force 1-phase, On = force 3-phase); default is 0 (disabled)
 AutoStartMode = 3
 
 [ONPREMISE]

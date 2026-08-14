@@ -72,11 +72,35 @@ class DbusGoeChargerService:
     # ~10s for the physical switch to complete) - not a soft parameter like
     # 'amp'. Tracked the same way as frc/amp to avoid redundant writes.
     self._lastCommandedPsm = None
+    # Remaining cycles for which pGrid/pPv/pAkku=0 should be pushed to flush
+    # the go-e's internal rolling averages (see the detailed note in
+    # _applyChargeMode). Configurable via PvAverageResetCycles in config.ini
+    # (default 5, the value confirmed live to work reliably; 0 disables this
+    # entirely). Defaults to running once right after a service restart too,
+    # not only when THIS process itself witnesses an Auto -> Manual/Scheduled
+    # transition: the go-e keeps its averages regardless of whether this
+    # script is running at all, so a restart while the go-e happens to be
+    # sitting on stale averages from an earlier session (possibly hours old)
+    # would otherwise never get flushed until some unrelated mode switch
+    # happened to occur during the new process's lifetime. If the very first
+    # cycle after startup finds the go-e is actually already in Auto, this is
+    # cancelled immediately (see the external lmo-change detection in
+    # _update()) so real values are never overwritten with zeros.
+    self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 5)
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
     acPosition = int(config['DEFAULT']['AcPosition'])
     pauseBetweenRequests = int(config['ONPREMISE']['PauseBetweenRequests']) # in ms
+    # Stored so that _update() doesn't have to re-read (and re-parse) it from
+    # config.ini on every single cycle. It used to do exactly that, twice per
+    # cycle, via an unguarded int(config['DEFAULT']['HardwareVersion']) - which
+    # meant an invalid or missing value would raise on every cycle in normal
+    # operation, not just at startup. The value only affects which temperature
+    # field is read, and changing it needs a restart anyway (like
+    # Deviceinstance/AcPosition above), so caching it here is both safer and
+    # cheaper.
+    self._hardwareVersion = hardwareVersion
 
     if pauseBetweenRequests <= 20:
       raise ValueError("Pause between requests must be greater than 20")
@@ -139,7 +163,17 @@ class DbusGoeChargerService:
     # fully enabled/disabled via config.ini. Default: off, so existing
     # installations keep their previous, monitoring-only behaviour after
     # updating this script, until explicitly enabled.
-    self._chargeControlEnabled = config.getboolean('DEFAULT', 'EnableChargeControl', fallback=False)
+    # Wrapped in try/except for the same reason as _getSetting()/AutoStartMode
+    # below: getboolean() raises ValueError on anything it doesn't recognize
+    # (it accepts 1/yes/true/on and 0/no/false/off, but not e.g. 'ja' or
+    # '1.0'), which here would prevent the service from starting at all rather
+    # than just ignoring one setting.
+    try:
+      self._chargeControlEnabled = config.getboolean('DEFAULT', 'EnableChargeControl', fallback=False)
+    except ValueError:
+      logging.warning("config.ini: EnableChargeControl is not a valid boolean (use true/false) - "
+                      "falling back to false (monitoring only)")
+      self._chargeControlEnabled = False
     if self._chargeControlEnabled:
       # only make /Mode actually writable when the control logic is enabled
       self._dbusservice.add_path('/Mode', 0, writeable=True, onchangecallback=self._handlechangedvalue)
@@ -152,14 +186,24 @@ class DbusGoeChargerService:
     # config.ini on every cycle via _getSetting()), since this defines the
     # very meaning of a control path and isn't something that should change
     # its behaviour mid-session without a restart.
-    # 0 = disabled (button has no function at all - psm is never touched)
-    # 1 = "1P-Auto": AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> Auto (psm=0) [default, matches this fork's original behaviour]
+    # 0 = disabled (button has no function at all - psm is never touched) [default]
+    # 1 = "1P-Auto": AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> Auto (psm=0)
     # 2 = "3P-Auto": AutoStart=0 -> force 3-phase (psm=2), AutoStart=1 -> Auto (psm=0)
     # 3 = "1P-3P":   AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> force 3-phase (psm=2) - Auto (psm=0) never used
-    self._autoStartMode = config.getint('DEFAULT', 'AutoStartMode', fallback=1)
+    # Defaults to 0 so that a repurposed control path is never silently active
+    # on an installation that didn't ask for it - matching how
+    # EnableChargeControl also defaults to off. Wrapped in try/except for the
+    # same reason as _getSetting(): getint() raises on a non-numeric value
+    # (e.g. writing 'true' instead of '1'), which here would prevent the
+    # service from starting at all.
+    try:
+      self._autoStartMode = config.getint('DEFAULT', 'AutoStartMode', fallback=0)
+    except ValueError:
+      logging.warning("config.ini: AutoStartMode is not a valid integer - falling back to 0 (disabled)")
+      self._autoStartMode = 0
     if self._autoStartMode not in (0, 1, 2, 3):
-      logging.warning("AutoStartMode=%s is not a recognized value (0/1/2/3) - falling back to 1 (1P-Auto)" % self._autoStartMode)
-      self._autoStartMode = 1
+      logging.warning("AutoStartMode=%s is not a recognized value (0/1/2/3) - falling back to 0 (disabled)" % self._autoStartMode)
+      self._autoStartMode = 0
 
     # add path values to dbus
     for path, settings in self._paths.items():
@@ -472,27 +516,37 @@ class DbusGoeChargerService:
         # go-e's own INTERNAL ROLLING AVERAGES of these values
         # (pvopt_averagePGrid/pvopt_averagePPv/pvopt_averagePAkku) do NOT -
         # confirmed live, they stay frozen at their last computed value
-        # indefinitely while in Manual/Scheduled, seemingly for as long as
-        # desired, with no visible decay. Since the Eco algorithm's
-        # start/stop and phase-switch decisions appear to be driven by these
-        # averages rather than the instantaneous raw values (this would also
-        # explain why simply pushing one fresh value immediately upon
-        # re-entering Auto did not fully prevent it from resuming as if the
-        # old surplus still applied - a single fresh sample does not
-        # immediately override several minutes of accumulated average), a
-        # one-time reset push of zeros is sent here, when Auto is left, to
-        # start nudging the stored averages back down towards "no known
-        # surplus" instead of leaving them frozen on a stale, possibly much
-        # higher value for however long Manual/Scheduled happens to last.
-        try:
-          payload = json.dumps({"pGrid": 0, "pPv": 0, "pAkku": 0}, separators=(',', ':'))
-          baseURL = "http://%s/api/set" % self._getConfig()['ONPREMISE']['Host']
-          requests.get(url=baseURL, params={'ids': payload}, timeout=1)
-          logging.info("Left Auto mode - sent one-time pGrid/pPv/pAkku=0 reset so the go-e's internal rolling averages start decaying instead of staying frozen on stale surplus data")
-        except Exception as e:
-          logging.warning("Could not send PV reset push on leaving Auto mode: %s" % e)
+        # indefinitely while in Manual/Scheduled, with no visible decay. Since
+        # the Eco algorithm's start/stop decisions appear to be driven by these
+        # averages rather than the instantaneous raw values, re-entering Auto
+        # would otherwise immediately resume charging based on a stale surplus
+        # figure from minutes or hours earlier.
+        #
+        # A SINGLE zero push was tried first and confirmed live to be
+        # insufficient: the averages stayed frozen at their old value
+        # (e.g. -2656W) even ~40s after switching to Manual. Pushing zeros
+        # over several consecutive cycles instead (via the counter below) was
+        # then confirmed live to reliably bring the averages to 0 and keep
+        # them there. An initial theory - that the go-e simply averages over
+        # 3 samples, based on average values always ending in .0/.3/.7 - does
+        # NOT fully hold up: an isolated follow-up test (pushing a known
+        # sequence of values directly, bypassing this script and its Auto
+        # mode entirely) produced averages that a plain mean of the pushed
+        # values cannot explain (e.g. a positive average after only
+        # negative/zero pushes). Something else - possibly a tariff/price
+        # signal this fork doesn't send or control - appears to factor in as
+        # well. The number of cycles needed is therefore configurable via
+        # PvAverageResetCycles in config.ini (default 5, confirmed reliable
+        # in real Auto-mode operation; 0 disables this reset entirely) rather
+        # than hardcoded, since the exact mechanism remains a partial black
+        # box and different installations/firmware may behave differently.
+        self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 5)
 
       if self._chargeMode == 1:
+        # Entering Auto - cancel any pending zero-flush from a previous exit,
+        # so it cannot keep pushing zeros over the real values we are about to
+        # start sending.
+        self._pvResetCyclesRemaining = 0
         # ROOT CAUSE FOUND (after extensive live testing): 'amp' is NOT the
         # live-regulated charge current - it is a CEILING that the go-e's Eco
         # algorithm will not exceed. The actual, live-regulated current is
@@ -862,8 +916,7 @@ class DbusGoeChargerService:
           14 = PF L3
           15 = PF N
           '''
-          config = self._getConfig()
-          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
+          hardwareVersion = self._hardwareVersion
 
           #send data to DBus
           self._dbusservice['/Ac/Voltage'] = int(data['nrg'][0])
@@ -958,12 +1011,33 @@ class DbusGoeChargerService:
 
             # In Auto mode, forward the PV surplus values to the go-e
             if self._chargeMode == 1:
+              # Also cancels any pending zero-flush (see below) - relevant
+              # right after a service restart if the go-e turns out to
+              # already be in Auto: the flush counter defaults to 5 (see
+              # __init__) precisely to catch the "stale averages from before
+              # this restart" case, but must not fire once real values are
+              # confirmed to be flowing.
+              self._pvResetCyclesRemaining = 0
               self._pushPvSurplusValues()
+            elif self._pvResetCyclesRemaining > 0:
+              # Just left Auto: keep pushing zeros for a few cycles so the
+              # go-e's 3-sample rolling averages are fully flushed rather than
+              # staying frozen on stale surplus data (see _applyChargeMode for
+              # the full explanation and the live evidence behind this).
+              try:
+                payload = json.dumps({"pGrid": 0, "pPv": 0, "pAkku": 0}, separators=(',', ':'))
+                baseURL = "http://%s/api/set" % self._getConfig()['ONPREMISE']['Host']
+                requests.get(url=baseURL, params={'ids': payload}, timeout=1)
+                self._pvResetCyclesRemaining -= 1
+                logging.info("Flushing go-e rolling averages after leaving Auto: pushed pGrid/pPv/pAkku=0 "
+                             "(%d cycle(s) remaining)" % self._pvResetCyclesRemaining)
+              except Exception as e:
+                logging.warning("Could not send PV reset push after leaving Auto mode: %s" % e)
+                self._pvResetCyclesRemaining -= 1
           else:
             currentLmo = None
 
-          config = self._getConfig()
-          hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
+          hardwareVersion = self._hardwareVersion
           if '/MCU/Temperature' in self._dbusservice: # check if path exists, at some point it was removed
              if hardwareVersion >= 3:
                 self._dbusservice['/MCU/Temperature'] = int(data['tma'][0] if data['tma'][0] else 0)

@@ -60,9 +60,11 @@ manual override of go-e's phase-switching logic (`psm`).
 needs a service restart to take effect, unlike most other settings, since
 this defines the meaning of a control path rather than a tuning value):
 
-- `AutoStartMode = 0`: disabled - the button has no function at all, `psm`
-  is never touched.
-- `AutoStartMode = 1` ("1P-Auto", **default**): `/AutoStart = 0` -> `psm = 1`
+- `AutoStartMode = 0` (**default**): disabled - the button has no function at
+  all, `psm` is never touched. This is the default deliberately: a repurposed
+  control path should never be silently active on an installation that didn't
+  ask for it, matching how `EnableChargeControl` also defaults to off.
+- `AutoStartMode = 1` ("1P-Auto"): `/AutoStart = 0` -> `psm = 1`
   (force single-phase); `/AutoStart = 1` -> `psm = 0` (**Auto** - go-e's own
   live, surplus-based 1-/3-phase switching).
 - `AutoStartMode = 2` ("3P-Auto"): `/AutoStart = 0` -> `psm = 2` (force
@@ -70,6 +72,10 @@ this defines the meaning of a control path rather than a tuning value):
 - `AutoStartMode = 3` ("1P-3P"): `/AutoStart = 0` -> `psm = 1` (force
   single-phase); `/AutoStart = 1` -> `psm = 2` (force three-phase) - `psm = 0`
   (Auto) is never used in this mode.
+
+An invalid or unrecognized value (e.g. `true`, or a number outside 0-3) logs a
+warning and falls back to `0` rather than preventing the service from
+starting.
 
 This was added because a household with little PV surplus most of the time
 may prefer to default to forced single-phase and only occasionally check
@@ -439,6 +445,25 @@ awkward to diagnose in the field.
   a realistic scenario for a mobile wallbox that isn't always on the GX
   device's network. Now always registered, with placeholder values and a
   warning when unavailable.
+- **`AutoStartMode` and `EnableChargeControl` could prevent the service from
+  starting.** Both are read with `getint()`/`getboolean()`, which raise on
+  anything unparseable - `getboolean()` in particular accepts only
+  `1/yes/true/on` and `0/no/false/off`, so writing e.g. `ja` was enough to
+  stop the service coming up at all rather than just ignoring one setting.
+  Both now log a warning and fall back to their (off) default. `AutoStartMode`
+  additionally had its default changed from `1` to `0`, so that a repurposed
+  control path is never silently active on an installation that didn't ask for
+  it - consistent with `EnableChargeControl` also defaulting to off. All other
+  defaults were reviewed at the same time and left as they were: every feature
+  flag defaults to "off"/`0`, and the two hysteresis values (`2`) only take
+  effect once their respective feature is deliberately enabled.
+- **`HardwareVersion` was re-read from disk twice per cycle, unguarded.**
+  `_update()` called `int(config['DEFAULT']['HardwareVersion'])` on every
+  cycle without a fallback, so an invalid or removed value would raise
+  continuously during normal operation, not just at startup. It only affects
+  which temperature field is read and requires a restart to change anyway
+  (like `Deviceinstance`/`AcPosition`), so it is now read once at startup and
+  cached - both safer and cheaper.
 - Also cleaned up: `import sys` appeared three times (inherited from the
   original), and a bare `except:` was narrowed to the exceptions it actually
   needs to catch.
@@ -486,12 +511,50 @@ live, `pgrid`/`ppv`/`pakku` (the raw instantaneous fields) correctly went
 did not, and appear to be what the Eco algorithm's start/stop and
 phase-switch decisions are actually driven by, rather than the raw
 instantaneous values. A single fresh sample upon re-entering Auto cannot
-immediately override several minutes of accumulated average. **Fixed**: a
-one-time `{"pGrid":0,"pPv":0,"pAkku":0}` reset push is now sent when Auto is
-*left* (entering Manual or Scheduled), so the stored averages start decaying
-towards "no known surplus" for the duration of the time spent outside Auto,
-instead of staying frozen on stale, possibly much higher surplus data
-indefinitely.
+immediately override several minutes of accumulated average.
+
+**First attempt (insufficient):** a single `{"pGrid":0,"pPv":0,"pAkku":0}`
+reset push when Auto is *left*. Confirmed live to not work - the averages
+stayed frozen at their old value (e.g. `-2656W`) even ~40s after switching to
+Manual, and re-entering Auto still resumed charging immediately.
+
+**Initial theory (later found incomplete):** the average values always end in
+`.0`/`.3`/`.7` and only change every third sample, suggesting the go-e
+averages over 3 samples - a single zero would then only be 1 of 3 values in
+that window, with no further samples to flush out the other two (the ~6s
+watchdog nulls the raw `pgrid`/`ppv`/`pakku` fields, but that does not touch
+the averages at all). Zeros were therefore pushed over multiple consecutive
+cycles instead of just one, and this was confirmed live to reliably bring the
+averages to 0 and keep them there.
+
+**However, an isolated follow-up test** - pushing a known sequence of values
+directly via `curl`, completely bypassing this script and its Auto-mode
+logic, with the real service stopped so it could not interfere - produced
+averages that a plain mean of the pushed values cannot explain (e.g. a
+*positive* average after a sequence of only negative and zero pushes, which
+is mathematically impossible for a simple average). The 3-sample theory
+therefore does not fully hold - something else, possibly a tariff/price
+signal this fork doesn't send or control, appears to factor in as well. The
+exact mechanism remains a partial black box. What is confirmed, from real
+Auto-mode operation rather than the isolated test: pushing zeros for enough
+consecutive cycles reliably brings the averages to 0 and keeps them there,
+and re-entering Auto afterwards no longer resumes on stale data. The number
+of cycles is configurable via `PvAverageResetCycles` (default `5`, `0`
+disables it) rather than hardcoded, precisely because the underlying mechanism
+isn't fully understood and a different installation or firmware version might
+need a different number.
+
+**Also flushed once after a service restart, not just on a live mode
+switch.** The go-e keeps its rolling averages regardless of whether this
+script is running - a restart while it happens to be sitting on stale
+averages from an earlier session (possibly hours old, from before the
+restart) would otherwise never get flushed until some unrelated mode switch
+happened to occur during the new process's lifetime. `self._pvResetCyclesRemaining`
+therefore defaults to `5` (not `0`) at startup. If the very first cycle finds
+the go-e is actually already in Auto, this is cancelled immediately (before
+any zero could be sent) so real values are never overwritten - verified live
+via the same mutual-exclusion structure that protects every other Auto-mode
+cycle.
 
 ### Phase-switch anti-flapping lock (`mptwt`) can cause a stop/start loop
 
@@ -626,6 +689,19 @@ allowed to help charge the EV too (virtual surplus added to `pGrid`).
   precise formula - this is a reasonable approximation, not a guaranteed
   exact match. `0` or omit = disabled (default).
 
+### Rolling-average reset after leaving Auto mode
+
+- **`PvAverageResetCycles`**: how many cycles of pushing `pGrid`/`pPv`/`pAkku`=0
+  to send after leaving Auto mode (see "Fresh PV data is pushed..." above for
+  the full background). `0` disables this entirely - the go-e's rolling
+  averages then simply stay frozen at whatever they were until real values
+  are pushed again. Default `5`, confirmed reliable in real Auto-mode
+  operation; the exact mechanism behind why the go-e's averages behave the
+  way they do remains a partial black box (an isolated follow-up test could
+  not fully explain it with a plain average of pushed values alone), so this
+  is deliberately left tunable rather than hardcoded in case a different
+  installation or firmware version needs a different number.
+
 ### Grid target (`pgt`)
 
 Not configured here - set it directly in the go-e app instead (App: PV
@@ -640,8 +716,8 @@ writes it.
   (see "`/AutoStart` repurposed..." above for the full reasoning). Read once
   at startup only - **a config.ini edit here needs a service restart**,
   unlike every other option on this page.
-  - `0` = disabled, the button has no function at all (`psm` never touched)
-  - `1` = "1P-Auto" (default): Off -> force 1-phase (`psm=1`), On -> Auto (`psm=0`)
+  - `0` = disabled, the button has no function at all (`psm` never touched) - **default**
+  - `1` = "1P-Auto": Off -> force 1-phase (`psm=1`), On -> Auto (`psm=0`)
   - `2` = "3P-Auto": Off -> force 3-phase (`psm=2`), On -> Auto (`psm=0`)
   - `3` = "1P-3P": Off -> force 1-phase (`psm=1`), On -> force 3-phase (`psm=2`) - Auto/`psm=0` never used
 
