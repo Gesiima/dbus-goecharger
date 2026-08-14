@@ -255,6 +255,13 @@ class DbusGoeChargerService:
     this, the current object is read, only 'control' is changed, and the whole
     object is written back - the times remain exactly as set in the go-e app.
     control: Disabled=0, Inside=1, Outside=2 (we only use 0/1)
+
+    IMPORTANT: uses compact JSON encoding (no whitespace after ':'/',') - the
+    default json.dumps() output previously caused this call to fail with
+    "ESP_ERR_HTTPD_RESULT_TRUNC" (URL too long for the go-e's small ESP32 HTTP
+    server buffer). Compact encoding saves ~30 characters per call, which may
+    be enough to stay under that limit - if it still fails on devices with
+    more configured time ranges, the URL may simply be too long regardless.
     '''
     control = 1 if enabled else 0
     config = self._getConfig()
@@ -266,9 +273,12 @@ class DbusGoeChargerService:
           continue
         schedObj = current[key]
         schedObj['control'] = control
-        payload = json.dumps({key: schedObj})
+        payload = json.dumps({key: schedObj}, separators=(',', ':'))
         baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
-        requests.get(url=baseURL, params={'ids': payload}, timeout=1)
+        request_data = requests.get(url=baseURL, params={'ids': payload}, timeout=2)
+        if not request_data or not getattr(request_data, 'ok', True):
+          logging.warning("Scheduler: setting %s failed (HTTP %s): %s" %
+                          (key, getattr(request_data, 'status_code', '?'), getattr(request_data, 'text', '')[:150]))
       except Exception as e:
         logging.critical('Error at %s', '_setGoeSchedulerEnabled(%s)' % key, exc_info=e)
 
@@ -340,10 +350,9 @@ class DbusGoeChargerService:
           logging.info("Auto mode: amp ceiling raised to %dA (device max) so the Eco algorithm can regulate freely" % maxAmp)
         else:
           logging.warning("Auto mode: /MaxCurrent not available - could not raise amp ceiling, Eco algorithm may stay capped at its last value")
-        # TEMPORARILY DISABLED for debugging: _setGoeSchedulerEnabled(False) -
-        # this call reliably fails with a 500 error (URL too long for the go-e's
-        # HTTP server) and is suspected of destabilizing lmo under real load.
-        # self._setGoeSchedulerEnabled(False)
+        # Disable the go-e's own weekly schedule while in Auto mode, so it
+        # cannot compete with the Eco algorithm's own start/stop decisions.
+        self._setGoeSchedulerEnabled(False)
         gridTarget = self._getSetting('PvGridTarget', 0)
         self._setGoeChargerValueV2('pgt', gridTarget)
         logging.info("Grid target (pgt) set: %s W" % gridTarget)
@@ -353,20 +362,28 @@ class DbusGoeChargerService:
           logging.warning("Could not set lmo=4 - _lastCommandedLmo left unchanged, will retry next cycle")
         logging.info("Charge mode: Auto (PV surplus enabled)")
       elif self._chargeMode == 2:
-        ok = self._setGoeChargerValueV2('lmo', 3)
+        # "Scheduled" in Venus OS activates the go-e's own "Daily Trip" mode
+        # (lmo=5) - NOT the separate weekly on/off timer (sch_week etc., which
+        # is a different, independent feature available under Basic mode).
+        # Daily Trip lets the go-e charge a target energy amount by a target
+        # time, optimizing for the cheapest tariff hours if configured -
+        # everything (target kWh, target time, tariff settings) remains fully
+        # defined in the go-e app; this script only switches the top-level
+        # mode, exactly like Auto/Manual.
+        ok = self._setGoeChargerValueV2('lmo', 5)
         self._setGoeChargerValueV2('fup', False)
         self._setGoeChargerValueV2('frc', 0)
-        # self._setGoeSchedulerEnabled(True)  # TEMPORARILY DISABLED for debugging
+        self._setGoeSchedulerEnabled(False)
         if ok:
-          self._lastCommandedLmo = 3
+          self._lastCommandedLmo = 5
         else:
-          logging.warning("Could not set lmo=3 - _lastCommandedLmo left unchanged, will retry next cycle")
-        logging.info("Charge mode: Scheduled (go-e's own schedule enabled)")
+          logging.warning("Could not set lmo=5 - _lastCommandedLmo left unchanged, will retry next cycle")
+        logging.info("Charge mode: Scheduled (go-e Daily Trip mode enabled - fully configured in the go-e app)")
       else:
         ok = self._setGoeChargerValueV2('lmo', 3)
         self._setGoeChargerValueV2('fup', False)
         self._setGoeChargerValueV2('frc', 1)
-        # self._setGoeSchedulerEnabled(False)  # TEMPORARILY DISABLED for debugging
+        self._setGoeSchedulerEnabled(False)
         if ok:
           self._lastCommandedLmo = 3
         else:
@@ -610,14 +627,21 @@ class DbusGoeChargerService:
           # the new control logic has been explicitly enabled via config.ini.
           if self._chargeControlEnabled:
             # Detect an external change of charge mode (e.g. the user switched
-            # to Eco/Normal directly in the go-e app, not via Venus OS). Only
-            # react if lmo has changed WITHOUT us having set it ourselves last.
+            # Eco/Daily Trip/Normal directly in the go-e app, not via Venus
+            # OS). Only react if lmo has changed WITHOUT us having set it
+            # ourselves last. lmo: 4=Eco (Auto), 5=Daily Trip (Scheduled),
+            # anything else (3=default/Basic) -> Manual.
             currentLmo = int(data['lmo']) if 'lmo' in data and data['lmo'] is not None else None
             if currentLmo is not None and currentLmo != self._lastCommandedLmo:
-              newChargeMode = 1 if currentLmo == 4 else 0
+              if currentLmo == 4:
+                newChargeMode = 1
+              elif currentLmo == 5:
+                newChargeMode = 2
+              else:
+                newChargeMode = 0
               if newChargeMode != self._chargeMode:
                 logging.info("External change detected: go-e lmo=%s -> charge mode set to %s" %
-                              (currentLmo, "Auto" if newChargeMode == 1 else "Manual"))
+                              (currentLmo, {1: "Auto", 2: "Scheduled"}.get(newChargeMode, "Manual")))
                 self._chargeMode = newChargeMode
                 self._dbusservice['/Mode'] = self._chargeMode
               self._lastCommandedLmo = currentLmo

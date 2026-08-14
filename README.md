@@ -45,9 +45,16 @@ behaves exactly like the original - monitoring only, `/Mode` stays read-only.
   it only ensures `amp` (a ceiling, not the live value - see below) is raised
   to the device's maximum whenever Auto mode is entered, so the Eco algorithm
   has its full regulation range available.
-- **Scheduled mode:** only enables/disables the go-e's own weekly schedule
-  (`sch_week`/`sch_satur`/`sch_sund`) - the time windows themselves continue to
-  be managed in the go-e app, not by this script
+- **Scheduled mode:** activates the go-e's own "Daily Trip" mode (`lmo=5`) -
+  target energy amount, target time, and tariff settings remain fully defined
+  in the go-e app; this script only switches the top-level mode, exactly like
+  Auto/Manual. **Not** to be confused with the go-e's separate weekly on/off
+  timer feature (`sch_week`/`sch_satur`/`sch_sund`, available under Basic
+  mode) - an earlier version of this fork mapped "Scheduled" to that timer
+  instead, which is a different, independent feature and does not match what
+  the go-e app calls "Daily Trip". If you are running an older build, update
+  it - the previous mapping is easy to confuse with Daily Trip since both are
+  reachable from a "Scheduled"-sounding selector, but behave very differently.
 - **Grid target (`pgt`):** for a battery reserve while PV-surplus charging
 - **Battery priority:** the EV only charges once the home battery reaches a
   configurable minimum SOC (with hysteresis against flapping)
@@ -131,6 +138,21 @@ the ceiling fix above.
   for `amp`/`alw`/`ama`) worked fine for `amp` in testing, but repeatedly and
   persistently failed for `alw` (error status/no response) - the exact cause
   was never conclusively determined. This fork uses `/api/set` consistently.
+- **Scheduler enable call (`sch_week`/`sch_satur`/`sch_sund`):** writing the
+  full object back via `ids={...}` (needed since these are nested JSON
+  objects, not simple scalars - see above) initially failed with
+  `ESP_ERR_HTTPD_RESULT_TRUNC` ("URL too long" - the go-e's small ESP32 HTTP
+  server has a limited request buffer). Fixed by encoding the JSON compactly
+  (`json.dumps(..., separators=(',', ':'))`, no spaces after `:`/`,`), saving
+  ~30 characters per call - enough to stay under the buffer limit in testing.
+  If this still fails on a device with more/longer configured time ranges (the
+  URL length depends on how many ranges are configured in the go-e app), the
+  object may simply be too long regardless of compact encoding. **Note:**
+  since "Scheduled" now activates Daily Trip (`lmo=5`, see above) instead, all
+  three Venus OS modes (Auto/Scheduled/Manual) explicitly *disable* this
+  weekly timer - none of them turn it on. If you want to use the go-e's
+  separate weekly on/off timer feature, it needs to be managed directly in the
+  go-e app; this fork's mode selector does not expose it.
 - `amx` (an API v1-only key, documented as *not* persisted to flash, "for PV
   regulation") does not exist on this device's API v2 firmware at all -
   confirmed absent both via a filtered and a full, unfiltered status dump.
