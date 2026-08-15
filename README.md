@@ -507,6 +507,18 @@ immediately if the
 first cycle finds the go-e already in Auto, so real values are never
 overwritten.
 
+**The same averaging lag also shows up while continuously staying in Auto**,
+not just when leaving and re-entering it - confirmed live with a clean,
+concrete example: `BatterySupportPower` was increased while already
+charging in Auto. The real `pGrid` reflected the larger boost immediately
+(`-3886` to `-3963`), but `pvopt_averagePGrid` stayed frozen at its old value
+(`-2934.7`) for a full ~40s (6 cycles) before catching up to `-3950.7` - the
+charge current only started climbing (5.7A -> 7.1A -> 7.4A and rising) in
+the very same cycle the average finally updated, not when the real value
+changed. This confirms the averaging behaviour is a general property of how
+the Eco algorithm evaluates surplus, not something specific to the Auto/
+Manual transition case above.
+
 ### Battery buffer: two bugs found after adding `BatterySupportMinSoc`
 
 - **Could discharge at night with no PV involved at all.** The SOC-based
