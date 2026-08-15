@@ -1,4 +1,12 @@
 #!/usr/bin/env python
+#
+# dbus-goecharger - go-eCharger integration for Victron Venus OS
+# https://github.com/Gesiima/dbus-goecharger
+#
+# Comments in this file are intentionally brief ("why", not "why in detail
+# with every measured value") - the full reasoning, live-test evidence, and
+# configuration reference for everything referenced below as "README
+# Findings" or "Configuration reference" is in README.md in the repo above.
 
 # import normal packages
 import platform
@@ -23,83 +31,39 @@ from vedbus import VeDbusService, VeDbusItemImport
 
 class DbusGoeChargerService:
   def __init__(self, servicename, paths, productname='go-eCharger', connection='go-eCharger HTTP JSON service'):
-    # NOTE on HTTP connections: a shared requests.Session() (for connection
-    # reuse/keep-alive) was tried here, then an explicit 'Connection: close'
-    # header was added on top after live testing showed the go-e closes its
-    # socket after every response without declaring this itself - causing
-    # urllib3's pool to attempt a doomed reuse first ("Resetting dropped
-    # connection") before opening a fresh connection, which is strictly worse
-    # than never pooling at all. CONFIRMED LIVE that this header did not
-    # reliably prevent the pool from still attempting reuse (the header only
-    # asks the *server* to close; it does not reliably stop this client's own
-    # pool from trying to reuse a still-pooled connection from an earlier
-    # call). Reverted back to plain module-level requests.get(...) calls
-    # everywhere below instead - confirmed to not exhibit this "attempt
-    # reuse, discover dead, reconnect" pattern, at the cost of not attempting
-    # keep-alive at all (irrelevant anyway, since the go-e doesn't support it
-    # reliably in the first place).
-    # Initialize state variables FIRST, since _handlechangedvalue (registered as
-    # onchangecallback) accesses them and could in theory already be called
-    # during setup.
+    # Plain requests.get() calls throughout, deliberately no shared Session -
+    # see README Findings ("HTTP connection handling") for why.
+    # State initialized FIRST, since _handlechangedvalue (onchangecallback)
+    # accesses it and could in theory already be called during setup.
     self._lastUpdate = 0
     self._chargingTime = 0.0
     self._chargeMode = 0            # 0=Manual, 1=Auto, 2=Scheduled
     self._lastCommandedLmo = None
     self._batteryPriorityPaused = False
     self._batterySupportActive = False
-    # Last 'frc' value we ourselves commanded, GLOBALLY across all modes (None
-    # = not yet known, e.g. right after service start). 'frc' physically
-    # clicks the go-e's charge contactor/relay on every write (confirmed
-    # live) - this tracker, together with _setFrc() below, ensures 'frc' is
-    # only ever written when the desired value actually differs from what we
-    # last commanded, regardless of which mode or code path is asking for it.
-    # Deliberately NOT reset on mode switches, since the goal is precisely to
-    # avoid redundant re-writes of an already-correct value across mode
-    # transitions (e.g. Auto -> Manual should not click the relay if frc was
-    # already 0 in both).
+    self._batteryForceStartActive = False
+    # 'frc' clicks the relay on every write - only written when it actually
+    # changes, globally across all modes. See README Findings ("frc
+    # physically clicks..."). Deliberately not reset on mode switches.
     self._lastCommandedFrc = None
-    # last amp value we ourselves commanded in Auto mode (None = never set).
-    # IMPORTANT: 'amp' is written to flash on every set on API v2 hardware
-    # (unlike the API v1-only 'amx' key, which does not exist on this API v2
-    # charger and was confirmed absent via live testing). To avoid excessive
-    # flash wear (~100,000 write cycles) from writing every 5s, 'amp' is only
-    # written when the computed target current actually changes - matching
-    # how evcc's own go-e driver behaves (confirmed via evcc source code).
+    # 'amp' ceiling - only written when the target actually changes, to
+    # avoid flash wear. See README Findings ("amp is a CEILING...").
     self._lastCommandedAmp = None
-    # Last 'psm' value we ourselves commanded (None = not yet known). Phase
-    # switching (psm: 0=Auto, 1=Force 1-phase, 2=Force 3-phase) involves a
-    # real, timed contactor changeover on the hardware (community reports
-    # ~10s for the physical switch to complete) - not a soft parameter like
-    # 'amp'. Tracked the same way as frc/amp to avoid redundant writes.
+    # 'psm' phase switching - real contactor changeover, tracked the same way
+    # as frc/amp to avoid redundant writes.
     self._lastCommandedPsm = None
-    # Remaining cycles for which pGrid/pPv/pAkku=0 should be pushed to flush
-    # the go-e's internal rolling averages (see the detailed note in
-    # _applyChargeMode). Configurable via PvAverageResetCycles in config.ini
-    # (default 5, the value confirmed live to work reliably; 0 disables this
-    # entirely). Defaults to running once right after a service restart too,
-    # not only when THIS process itself witnesses an Auto -> Manual/Scheduled
-    # transition: the go-e keeps its averages regardless of whether this
-    # script is running at all, so a restart while the go-e happens to be
-    # sitting on stale averages from an earlier session (possibly hours old)
-    # would otherwise never get flushed until some unrelated mode switch
-    # happened to occur during the new process's lifetime. If the very first
-    # cycle after startup finds the go-e is actually already in Auto, this is
-    # cancelled immediately (see the external lmo-change detection in
-    # _update()) so real values are never overwritten with zeros.
-    self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 5)
+    # Rolling-average reset cycle counter - see README Findings ("Fresh PV
+    # data is pushed..."). Configurable via PvAverageResetCycles, default 0
+    # (disabled). Also runs once after a restart, cancelled immediately if
+    # the go-e turns out to already be in Auto (see _update()'s lmo check).
+    self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 0)
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
     acPosition = int(config['DEFAULT']['AcPosition'])
     pauseBetweenRequests = int(config['ONPREMISE']['PauseBetweenRequests']) # in ms
-    # Stored so that _update() doesn't have to re-read (and re-parse) it from
-    # config.ini on every single cycle. It used to do exactly that, twice per
-    # cycle, via an unguarded int(config['DEFAULT']['HardwareVersion']) - which
-    # meant an invalid or missing value would raise on every cycle in normal
-    # operation, not just at startup. The value only affects which temperature
-    # field is read, and changing it needs a restart anyway (like
-    # Deviceinstance/AcPosition above), so caching it here is both safer and
-    # cheaper.
+    # Cached rather than re-read every cycle - see README Findings ("Other
+    # robustness findings").
     self._hardwareVersion = hardwareVersion
 
     if pauseBetweenRequests <= 20:
@@ -125,16 +89,9 @@ class DbusGoeChargerService:
     self._dbusservice.add_path('/ProductId', 0xFFFF) #
     self._dbusservice.add_path('/ProductName', productname)
     self._dbusservice.add_path('/CustomName', productname)
-    # IMPORTANT: these two paths are registered unconditionally, even if the
-    # go-e was unreachable at startup (data is None). D-Bus paths can only be
-    # added before the service is registered - if they were skipped here, they
-    # would be missing for the entire lifetime of the process, even once the
-    # charger comes back. This matters in practice for a mobile wallbox that
-    # isn't always on the same network as the GX device: the service would
-    # otherwise silently come up permanently missing its firmware/serial
-    # entries, purely depending on whether the charger happened to answer
-    # during those first few hundred milliseconds. Placeholder values are used
-    # when unavailable; the fields are informational only.
+    # Registered unconditionally even if the go-e was unreachable at startup -
+    # D-Bus paths can't be added later. See README Findings ("Detailed
+    # /Status reporting and /Connected").
     fwv = 0
     serial = 'unknown'
     if data:
@@ -158,16 +115,10 @@ class DbusGoeChargerService:
     # /Status: read-only, reflects the car state (set in _update)
     self._dbusservice.add_path('/Status', None)
 
-    # Feature flag: the entire new control logic (mode switching, PV push,
-    # scheduler control, grid target, battery priority, battery buffer) can be
-    # fully enabled/disabled via config.ini. Default: off, so existing
-    # installations keep their previous, monitoring-only behaviour after
-    # updating this script, until explicitly enabled.
-    # Wrapped in try/except for the same reason as _getSetting()/AutoStartMode
-    # below: getboolean() raises ValueError on anything it doesn't recognize
-    # (it accepts 1/yes/true/on and 0/no/false/off, but not e.g. 'ja' or
-    # '1.0'), which here would prevent the service from starting at all rather
-    # than just ignoring one setting.
+    # Master switch for all extended control logic. Default off, so existing
+    # installations keep the original monitoring-only behaviour until
+    # explicitly enabled. getboolean() raises on unparseable values (e.g.
+    # 'ja') - guarded so a typo can't prevent the service from starting.
     try:
       self._chargeControlEnabled = config.getboolean('DEFAULT', 'EnableChargeControl', fallback=False)
     except ValueError:
@@ -181,21 +132,14 @@ class DbusGoeChargerService:
       # otherwise, as in the original: a plain display value, not writable
       self._dbusservice.add_path('/Mode', 0)
 
-    # What the repurposed /AutoStart toggle actually does - read ONCE at
-    # startup only (unlike most other tuning values, which are re-read from
-    # config.ini on every cycle via _getSetting()), since this defines the
-    # very meaning of a control path and isn't something that should change
-    # its behaviour mid-session without a restart.
-    # 0 = disabled (button has no function at all - psm is never touched) [default]
-    # 1 = "1P-Auto": AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> Auto (psm=0)
-    # 2 = "3P-Auto": AutoStart=0 -> force 3-phase (psm=2), AutoStart=1 -> Auto (psm=0)
-    # 3 = "1P-3P":   AutoStart=0 -> force 1-phase (psm=1), AutoStart=1 -> force 3-phase (psm=2) - Auto (psm=0) never used
-    # Defaults to 0 so that a repurposed control path is never silently active
-    # on an installation that didn't ask for it - matching how
-    # EnableChargeControl also defaults to off. Wrapped in try/except for the
-    # same reason as _getSetting(): getint() raises on a non-numeric value
-    # (e.g. writing 'true' instead of '1'), which here would prevent the
-    # service from starting at all.
+    # What the repurposed /AutoStart toggle does - read once at startup only,
+    # since this defines the meaning of a control path rather than a tuning
+    # value (needs a restart to change). See README ("/AutoStart repurposed
+    # as a phase-switching override") for the full reasoning.
+    # 0 = disabled (default) - psm never touched
+    # 1 = "1P-Auto": AutoStart=0 -> psm=1, AutoStart=1 -> psm=0 (Auto)
+    # 2 = "3P-Auto": AutoStart=0 -> psm=2, AutoStart=1 -> psm=0 (Auto)
+    # 3 = "1P-3P":   AutoStart=0 -> psm=1, AutoStart=1 -> psm=2 (psm=0 unused)
     try:
       self._autoStartMode = config.getint('DEFAULT', 'AutoStartMode', fallback=0)
     except ValueError:
@@ -220,33 +164,15 @@ class DbusGoeChargerService:
     logging.info("AutoStartMode=%s: %s" % (self._autoStartMode,
                  {0: "disabled, /AutoStart has no function", 1: "1P-Auto", 2: "3P-Auto", 3: "1P-3P"}[self._autoStartMode]))
 
-    # Private, separate connection to the system D-Bus, to read PV/grid/battery
-    # values from com.victronenergy.system (for Auto mode / PV surplus push).
-    # Kept separate from self._dbusservice, since this connection only reads
-    # and does not register a service.
+    # Separate read-only connection to com.victronenergy.system for PV/grid/
+    # battery values (Auto mode / PV surplus push).
     systemBus = dbus.SystemBus()
     try:
-      # pGrid: no equivalent aggregated "Total" path could be confirmed for
-      # /Ac/Grid/* (unlike /Ac/PvOnGrid/Total/Power below) - L1/L2/L3 are
-      # therefore read and summed explicitly. This matters whenever the grid
-      # CONNECTION POINT itself is three-phase (a proper multi-phase grid
-      # meter measuring all three phases), even if only one phase is actually
-      # managed by a single-phase Multiplus/inverter - load or generation on
-      # the other two phases would otherwise be invisible to pGrid entirely,
-      # even though it directly affects real grid import/export.
+      # pGrid/pPv: explicit L1+L2+L3 summing, no aggregate "Total" path - see
+      # README Findings ("PV/grid reading") for why.
       self._gridPowerItemL1 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L1/Power')
       self._gridPowerItemL2 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L2/Power')
       self._gridPowerItemL3 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L3/Power')
-      # AC-coupled PV: /Ac/PvOnGrid/Total/Power (a dbus-systemcalc-py
-      # aggregate) looked like a clean shortcut, but was CONFIRMED LIVE to
-      # not exist on this system - `dbus -y com.victronenergy.system
-      # /Ac/PvOnGrid/Total/Power GetValue` raised an AttributeError from the
-      # dbus CLI itself (no such object). This silently degraded to 0 via
-      # this fork's own _safeGetValue() defensive handling - not a crash, but
-      # a real, unnoticed loss of the entire AC-coupled contribution to pPv
-      # (confirmed live: ~1700W of real AC PV production was missing,
-      # leaving only the ~650W DC-coupled portion). Reverted to explicit
-      # L1/L2/L3 summing, matching the approach already used for pGrid above.
       self._pvPowerAcItemL1 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/PvOnGrid/L1/Power')
       self._pvPowerAcItemL2 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/PvOnGrid/L2/Power')
       self._pvPowerAcItemL3 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/PvOnGrid/L3/Power')
@@ -273,20 +199,11 @@ class DbusGoeChargerService:
 
   def _safeGetValue(self, item, itemName):
     '''
-    Wraps item.get_value() defensively. Live testing showed that a Venus OS
-    system dbus item (e.g. a newly added path like /Ac/Grid/L2/Power,
-    /Ac/Grid/L3/Power, or /Ac/PvOnGrid/Total/Power that may not exist or be
-    served on every Venus OS version/configuration) can raise a raw
-    dbus.exceptions.DBusException ("was not provided by any .service files")
-    at the moment of the FIRST actual .get_value() call, even though
-    constructing the VeDbusItemImport object itself succeeded without error -
-    this is different from (and not caught by) the try/except around item
-    construction in __init__. An uncaught exception here previously crashed
-    the entire service. Every read of a Venus system item now goes through
-    this method instead of calling .get_value() directly, so a single
-    missing/unavailable value degrades gracefully (treated the same as an
-    item that was None from the start) instead of taking down the whole
-    process.
+    Wraps item.get_value() defensively - a Venus system item can raise a raw
+    DBusException at the moment of the actual call (not just at
+    construction), crashing the service if not caught. See README Findings
+    ("PV/grid reading" / DBusException). Every read of a Venus system item
+    goes through this instead of calling .get_value() directly.
     '''
     if item is None:
       return None
@@ -328,19 +245,11 @@ class DbusGoeChargerService:
     '''
     Sets a simple, scalar go-e API v2 key (lmo, fup, frc, alw, amp, ama, psm, ...)
     via a direct query parameter on /api/set (e.g. /api/set?lmo=4) - NOT via the
-    ids={...} JSON-batch parameter.
-
-    ROOT CAUSE FOUND (after extensive live testing): earlier versions of this
-    method wrapped every key in ids={"key":value}, matching the mechanism
-    required for pGrid/pPv/pAkku and the scheduler objects (which have no
-    single-key setter and genuinely require ids=). For simple scalar keys like
-    lmo/frc, however, this was wrong: manual tests using the plain query
-    parameter form (?lmo=4, ?frc=1) were rock-solid stable, while the exact
-    same values sent via ids={"lmo":4} were silently reverted by the go-e
-    within well under a second. The two write paths are evidently handled
-    differently internally by the firmware. Plain query parameters are
-    therefore used here; ids={...} is reserved for pGrid/pPv/pAkku and the
-    scheduler objects, which are set directly in their respective methods.
+    ids={...} JSON-batch parameter, which is reserved for pGrid/pPv/pAkku and
+    the scheduler objects (no single-key setter, genuinely require ids=). See
+    README Findings ("API endpoint quirks") for why: sending scalar keys via
+    ids={...} was found to be silently reverted by the go-e within under a
+    second, while plain query parameters were rock-solid.
     '''
     config = self._getConfig()
     baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
@@ -487,20 +396,14 @@ class DbusGoeChargerService:
   def _applyChargeMode(self):
     '''
     Sends the selected charge mode to the go-e:
-    Auto (1)      -> lmo=4 (Eco mode), fup=true, frc=0 (neutral - let the Eco
-                     algorithm decide on/off itself), grid target (pgt)
-                     (go-e takes over PV surplus control, including phase
-                     switching, by itself)
-    Scheduled (2) -> lmo=3, frc=0 (neutral - let the go-e's own schedule decide on/off)
-    Manual (0)    -> lmo=3, frc=1 (force off) as a safe default when entering
-                     Manual, direct control afterwards via SetCurrent/StartStop
+    Auto (1)      -> lmo=4 (Eco), fup=true, amp raised to device max, fresh
+                     pGrid/pPv/pAkku pushed, frc set based on battery priority
+    Scheduled (2) -> lmo=5 (Daily Trip), fup=false, frc=0
+    Manual (0)    -> lmo=3 (Basic), frc=0 if actively charging (car==2, so an
+                     active Auto session continues seamlessly), else frc=1
 
-    IMPORTANT finding from live testing: plain alw=false is NOT reliably
-    respected by the go-e while its own Eco algorithm considers charging
-    active/justified (e.g. right after a PV surplus push) - it gets silently
-    reverted back to alw=true within seconds. The dedicated 'frc' (force state:
-    0=Neutral, 1=Off, 2=On) key reliably overrides this and was confirmed
-    stable over 15+ seconds in testing, unlike alw alone.
+    'frc' (force state: 0=Neutral, 1=Off, 2=On) is used instead of 'alw' -
+    see README Findings ("API endpoint quirks") for why.
     '''
     try:
       # Reset Auto-mode-specific state when leaving Auto - the actual 'frc'
@@ -510,60 +413,21 @@ class DbusGoeChargerService:
       if self._chargeMode != 1:
         self._batteryPriorityPaused = False
         self._batterySupportActive = False
+        self._batteryForceStartActive = False
         self._lastCommandedAmp = None
-        # IMPORTANT (found live): the raw pGrid/pPv/pAkku fields correctly go
-        # null once this fork stops pushing them (on leaving Auto), but the
-        # go-e's own INTERNAL ROLLING AVERAGES of these values
-        # (pvopt_averagePGrid/pvopt_averagePPv/pvopt_averagePAkku) do NOT -
-        # confirmed live, they stay frozen at their last computed value
-        # indefinitely while in Manual/Scheduled, with no visible decay. Since
-        # the Eco algorithm's start/stop decisions appear to be driven by these
-        # averages rather than the instantaneous raw values, re-entering Auto
-        # would otherwise immediately resume charging based on a stale surplus
-        # figure from minutes or hours earlier.
-        #
-        # A SINGLE zero push was tried first and confirmed live to be
-        # insufficient: the averages stayed frozen at their old value
-        # (e.g. -2656W) even ~40s after switching to Manual. Pushing zeros
-        # over several consecutive cycles instead (via the counter below) was
-        # then confirmed live to reliably bring the averages to 0 and keep
-        # them there. An initial theory - that the go-e simply averages over
-        # 3 samples, based on average values always ending in .0/.3/.7 - does
-        # NOT fully hold up: an isolated follow-up test (pushing a known
-        # sequence of values directly, bypassing this script and its Auto
-        # mode entirely) produced averages that a plain mean of the pushed
-        # values cannot explain (e.g. a positive average after only
-        # negative/zero pushes). Something else - possibly a tariff/price
-        # signal this fork doesn't send or control - appears to factor in as
-        # well. The number of cycles needed is therefore configurable via
-        # PvAverageResetCycles in config.ini (default 5, confirmed reliable
-        # in real Auto-mode operation; 0 disables this reset entirely) rather
-        # than hardcoded, since the exact mechanism remains a partial black
-        # box and different installations/firmware may behave differently.
-        self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 5)
+        # Flushes the go-e's internal rolling averages, which otherwise stay
+        # frozen while not in Auto - see README Findings ("Fresh PV data is
+        # pushed..."). Configurable via PvAverageResetCycles, default 0.
+        self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 0)
 
       if self._chargeMode == 1:
         # Entering Auto - cancel any pending zero-flush from a previous exit,
         # so it cannot keep pushing zeros over the real values we are about to
         # start sending.
         self._pvResetCyclesRemaining = 0
-        # ROOT CAUSE FOUND (after extensive live testing): 'amp' is NOT the
-        # live-regulated charge current - it is a CEILING that the go-e's Eco
-        # algorithm will not exceed. The actual, live-regulated current is
-        # reflected in nrg[4] (A) / nrg[11] (W), never in 'amp' itself. If
-        # 'amp' was left at a low value (e.g. 6, from Manual mode or an
-        # earlier test), the Eco algorithm is silently capped there and
-        # cannot regulate upward at all - this looked exactly like "the Eco
-        # algorithm doesn't respond to pGrid" during many hours of testing,
-        # when in fact it was working correctly the whole time, just capped
-        # by our own leftover ceiling. Confirmed live: with amp raised to 16,
-        # a simulated ~2070W surplus (9A) made the real current climb from
-        # ~5.6A to ~8.2A and rising within 40s - clear, genuine regulation.
-        # The ceiling is therefore raised to the device's configured maximum
-        # (ama/'/MaxCurrent') every time Auto mode is (re-)entered, so the Eco
-        # algorithm always has its full intended regulation range available -
-        # this is NOT computing the charge current ourselves, it only removes
-        # an artificial constraint so the go-e's own algorithm can do its job.
+        # 'amp' is a CEILING, not the live-regulated current - see README
+        # Findings ("amp is a CEILING..."). Raised to device max on every
+        # Auto entry so the Eco algorithm has its full regulation range.
         try:
           maxAmp = int(self._dbusservice['/MaxCurrent'])
         except Exception:
@@ -576,33 +440,13 @@ class DbusGoeChargerService:
         else:
           logging.warning("Auto mode: /MaxCurrent not available - could not raise amp ceiling, Eco algorithm may stay capped at its last value")
 
-        # IMPORTANT (found live): fresh pGrid/pPv/pAkku values are pushed
-        # BEFORE lmo is switched to 4 (Eco), not after. Confirmed live: Auto
-        # (charging on real surplus) -> Manual (continues charging, per the
-        # frc fix above) -> Auto again later once it had actually gone dark
-        # caused the go-e to immediately resume charging as if the old
-        # surplus still applied. The go-e appears to keep its last-received
-        # pGrid/pPv/pAkku values around indefinitely while lmo!=4 (Eco isn't
-        # evaluating them, so there is nothing to invalidate the old
-        # reading), and then acts on whatever it has stored the instant Eco
-        # re-activates - if that happens to be a fresh push, fine; if lmo=4
-        # is set first and our fresh push follows moments later, there is a
-        # brief window where Eco could start evaluating using the old,
-        # possibly many-minutes-stale surplus value instead. Sending the
-        # fresh values first closes that window entirely: by the time lmo
-        # actually flips to 4, the most current real reading is already the
-        # "last known" value for Eco to act on. This call also determines and
-        # writes the correct initial frc value based on battery priority
-        # (frc itself is independent of lmo and safe to set regardless of
-        # the current mode) - see the frc-click note in _setFrc() itself for
-        # why this ordering also matters for avoiding redundant relay clicks.
+        # Fresh pGrid/pPv/pAkku pushed BEFORE lmo=4, not after - see README
+        # Findings ("Fresh PV data is pushed..."). Also determines/writes the
+        # correct initial frc value based on battery priority.
         self._pushPvSurplusValues()
 
         # Disable the go-e's own weekly schedule while in Auto mode, so it
         # cannot compete with the Eco algorithm's own start/stop decisions.
-        # (Grid target 'pgt' is no longer set here separately - the
-        # _pushPvSurplusValues() call above already sets/tracks it on every
-        # cycle now, including this first one right after entering Auto.)
         self._setGoeSchedulerEnabled(False)
         ok = self._setGoeChargerValueV2('lmo', 4)
         self._setGoeChargerValueV2('fup', True)
@@ -612,14 +456,9 @@ class DbusGoeChargerService:
           logging.warning("Could not set lmo=4 - _lastCommandedLmo left unchanged, will retry next cycle")
         logging.info("Charge mode: Auto (PV surplus enabled)")
       elif self._chargeMode == 2:
-        # "Scheduled" in Venus OS activates the go-e's own "Daily Trip" mode
-        # (lmo=5) - NOT the separate weekly on/off timer (sch_week etc., which
-        # is a different, independent feature available under Basic mode).
-        # Daily Trip lets the go-e charge a target energy amount by a target
-        # time, optimizing for the cheapest tariff hours if configured -
-        # everything (target kWh, target time, tariff settings) remains fully
-        # defined in the go-e app; this script only switches the top-level
-        # mode, exactly like Auto/Manual.
+        # "Scheduled" activates the go-e's own "Daily Trip" mode (lmo=5) - NOT
+        # the separate weekly timer (sch_week etc.). See README Findings
+        # ("'Scheduled' mode vs. the go-e's weekly timer").
         ok = self._setGoeChargerValueV2('lmo', 5)
         self._setGoeChargerValueV2('fup', False)
         self._setFrc(0)
@@ -630,22 +469,10 @@ class DbusGoeChargerService:
           logging.warning("Could not set lmo=5 - _lastCommandedLmo left unchanged, will retry next cycle")
         logging.info("Charge mode: Scheduled (go-e Daily Trip mode enabled - fully configured in the go-e app)")
       else:
-        # IMPORTANT: Basic mode (lmo=3) has NO PV-surplus gating logic of its
-        # own - unlike Eco mode, it does not wait for anything and simply
-        # charges immediately once frc allows it and a vehicle is connected.
-        # This means frc=0 (neutral) is only safe to use here if charging was
-        # ALREADY actively happening at the moment of the switch (e.g. active
-        # PV-surplus charging in Auto) - continuing that seamlessly is
-        # desired and matches the earlier frc-click fix below. But if
-        # charging was NOT actively happening right then (e.g. paused in
-        # Auto due to insufficient PV surplus), frc=0 would make Basic mode
-        # immediately start charging at the full amp ceiling on its own -
-        # which is generally not wanted: switching to Manual is usually meant
-        # to simply turn Auto off, not to start a manual charge. The go-e's
-        # actual current 'car' state is therefore checked right before
-        # deciding: only car==2 (actively charging) keeps frc=0; anything
-        # else forces frc=1, taking over "whatever is currently active"
-        # instead of blindly always releasing.
+        # Basic mode (lmo=3) has no PV-surplus gating of its own - frc=0 is
+        # only safe here if charging was already active (continues
+        # seamlessly); otherwise frc=1 to avoid an unwanted auto-start at the
+        # full amp ceiling. See README Findings ("frc physically clicks...").
         currentCarState = None
         try:
           carData = self._getGoeChargerData('car')
@@ -670,19 +497,14 @@ class DbusGoeChargerService:
 
   def _pushPvSurplusValues(self):
     '''
-    Reads PV/grid/battery power from Venus OS (com.victronenergy.system) and
-    forwards it in the go-e's own format. According to the go-e API this must
-    be called every 5 seconds, otherwise the last value is kept (see warning
-    in __init__).
+    Reads PV/grid/battery power from Venus OS and forwards it in the go-e's
+    own format. Must be called at least every 5s, otherwise the last value
+    is kept (watchdog - see README Findings, "Timing behaviour").
 
-    IMPORTANT - sign convention not yet verified live:
-    - pGrid: >0 = grid import, <0 = feed-in (Venus convention matches the go-e convention directly)
-    - pPv:   >0 = production
-    - pAkku: go-e wants <0 = battery charging. Venus typically reports >0 = charging,
-             hence inverted here. Please verify against reality after the first
-             test run via "dbus -y com.victronenergy.system / GetValue" (does the
-             battery actually charge when /Dc/Battery/Power is positive?) and
-             adjust the sign below if it does not match.
+    Sign convention (confirmed via official go-e docs and live energy-balance
+    checks - see README Findings): pGrid >0 = import, <0 = feed-in; pPv >0 =
+    production; pAkku <0 = battery charging, >0 = discharging (Venus reports
+    /Dc/Battery/Power the opposite way, hence inverted below).
     '''
     if self._gridPowerItemL1 is None:
       return
@@ -690,15 +512,10 @@ class DbusGoeChargerService:
     try:
       config = self._getConfig()
 
-      # Safety net for the 'amp' ceiling (see _applyChargeMode for the full
-      # root-cause explanation): _applyChargeMode() only raises the ceiling
-      # at the moment of an explicit mode switch via the GUI/D-Bus callback.
-      # If the service restarts while the go-e is ALREADY in Auto mode (e.g.
-      # after a service or Venus OS restart), that code path is never hit -
-      # _update()'s external-change-detection only adopts the existing mode
-      # without calling _applyChargeMode(). This check runs on every Auto-mode
-      # cycle instead, so the ceiling is guaranteed to be raised regardless of
-      # how Auto mode was entered - not just when switched via the GUI.
+      # Safety net for the 'amp' ceiling - _applyChargeMode() only raises it
+      # on an explicit mode switch; this re-checks every cycle so a service
+      # restart while already in Auto also gets it raised. See README
+      # Findings ("amp is a CEILING...").
       try:
         maxAmp = int(self._dbusservice['/MaxCurrent'])
       except Exception:
@@ -711,26 +528,13 @@ class DbusGoeChargerService:
         else:
           logging.warning("Could not confirm amp ceiling at %dA - will retry next cycle" % maxAmp)
 
-      # Grid target (pgt) is intentionally NEVER written by this fork -
-      # configure it directly in the go-e app instead (PV surplus -> Grid
-      # target). An earlier version of this script managed pgt via
-      # config.ini, including a fairly involved "master value" mechanism to
-      # reconcile config.ini edits with direct changes in the go-e app - this
-      # added real complexity and a real bug (an app-side change could be
-      # silently reverted again on the very next cycle) for a value that is
-      # just as easy to set once, directly where it actually takes effect.
-      # The current value is still read (see the BatterySupportCompensatePgt
-      # handling below) to compensate for it when the battery buffer feature
-      # is active, but this script has no writable opinion on what it should be.
+      # pgt is intentionally never written - configure it in the go-e app
+      # instead. See README ("Grid target (pgt)") for why. Only read below,
+      # for BatterySupportCompensatePgt.
 
-      # Battery priority: only release EV charging once the battery SOC has
-      # reached a configured minimum threshold (similar to the evcc setting).
-      # Hysteresis (default 2%) prevents frequent on/off flapping right at the
-      # threshold: charging pauses below minSoc, and is only released again once
-      # SOC >= minSoc + hysteresis. This only updates self._batteryPriorityPaused;
-      # the actual frc write happens in one combined place below, together with
-      # the insufficient-surplus check, to avoid two independent code paths
-      # writing frc back-to-back in the same cycle.
+      # Battery priority: pauses charging below a configured SOC, released
+      # again at minSoc+hysteresis. Only updates the flag here; the frc write
+      # happens in one combined place below (see comment there for why).
       minBatterySoc = self._getSetting('BatteryPriorityMinSoc', 0)
       if minBatterySoc > 0 and self._batterySocItem is not None:
         hysteresis = self._getSetting('BatteryPriorityHysteresis', 2)
@@ -749,12 +553,7 @@ class DbusGoeChargerService:
             logging.debug("Auto mode: battery SOC %s%% < %s%% - EV charging should pause (battery priority)" %
                           (batterySoc, minBatterySoc))
 
-      # gridPower: summed explicitly across L1/L2/L3 (see __init__ comment) -
-      # important for a three-phase grid CONNECTION POINT even when only one
-      # phase is managed by a single-phase Multiplus/inverter, so load or
-      # generation on the other phases is not silently missed. L1 is treated
-      # as required (checked above); L2/L3 are optional and simply contribute
-      # 0 if not present/available (e.g. a genuinely single-phase connection).
+      # Explicit L1+L2+L3 summing - see README Findings ("PV/grid reading").
       gridPowerL1 = self._safeGetValue(self._gridPowerItemL1, '/Ac/Grid/L1/Power')
       gridPowerL2 = self._safeGetValue(self._gridPowerItemL2, '/Ac/Grid/L2/Power')
       gridPowerL3 = self._safeGetValue(self._gridPowerItemL3, '/Ac/Grid/L3/Power')
@@ -778,13 +577,14 @@ class DbusGoeChargerService:
       pPv = pvPower
       pAkku = -1 * batteryPower  # see docstring - adjust sign if needed
 
-      # Battery as a charging buffer: above an SOC threshold, a fixed additional
-      # amount of "virtual surplus" from the battery is allowed to flow into the
-      # car (similar to evcc's "battery as buffer above X%" feature). The battery
-      # supplies this energy automatically once the go-e requests more power than
-      # pure PV production covers - Venus OS/ESS balances this physically on its own.
+      # Battery as a charging buffer: above an SOC threshold, additional
+      # battery power is reported as virtual surplus (evcc's "battery as
+      # buffer above X%"). See README Findings ("Battery buffer...") and
+      # "Configuration reference" for the full three-tier design.
       maxSocForSupport = self._getSetting('BatterySupportMinSoc', 0)
       supportPower = self._getSetting('BatterySupportPower', 0)
+      minPvForSupport = self._getSetting('BatterySupportMinPv', 0)
+      forceStartSoc = self._getSetting('BatteryForceStartSoc', 0)
       if maxSocForSupport > 0 and supportPower > 0 and self._batterySocItem is not None:
         supportHysteresis = self._getSetting('BatterySupportHysteresis', 2)
         batterySocForSupport = self._safeGetValue(self._batterySocItem, '/Dc/Battery/Soc')
@@ -799,32 +599,31 @@ class DbusGoeChargerService:
             if batterySocForSupport >= maxSocForSupport:
               self._batterySupportActive = True
 
-          if self._batterySupportActive:
-            # IMPORTANT finding from live testing: pGrid, not pPv, appears to
-            # be the value that actually drives the go-e's charging decision -
-            # every successful test so far worked by making pGrid sufficiently
-            # negative; adding only to pPv while pGrid stayed near zero
-            # produced no reaction at all, even though pAkku correctly showed
-            # the battery discharging. The virtual surplus is therefore added
-            # to pGrid (making it more negative = more exportable surplus),
-            # not to pPv.
+          # Force-start tier: separate hysteresis state, reuses the same
+          # hysteresis value as the tier above.
+          if forceStartSoc > 0:
+            if self._batteryForceStartActive:
+              if batterySocForSupport < forceStartSoc - supportHysteresis:
+                self._batteryForceStartActive = False
+            else:
+              if batterySocForSupport >= forceStartSoc:
+                self._batteryForceStartActive = True
+          else:
+            self._batteryForceStartActive = False
+
+          # BatterySupportMinPv gates the boost on real PV also being present
+          # (unless the force-start tier bypasses it) - see README Findings
+          # ("Battery buffer could discharge at night..."). The explicit
+          # "minPvForSupport > 0" check matters: see README Findings
+          # ("BatterySupportMinPv=0 did not reliably mean disabled").
+          if self._batterySupportActive and minPvForSupport > 0 and pPv < minPvForSupport and not self._batteryForceStartActive:
+            logging.debug("Battery buffer eligible (SOC=%s%%) but pPv=%sW is below BatterySupportMinPv=%sW - no virtual surplus applied this cycle" %
+                          (batterySocForSupport, pPv, minPvForSupport))
+          elif self._batterySupportActive:
+            # Added to pGrid, not pPv - see README Findings ("Battery
+            # buffer...") for why pGrid is what actually drives the go-e.
             adjustment = supportPower
-            # Optional compensation for pgt's continuous reserve (see "The
-            # grid target (pgt) acts continuously" in the README): pgt keeps
-            # subtracting its own reserve from whatever pGrid reports,
-            # including this virtual battery-support surplus - so without
-            # compensating for it, less than the configured BatterySupportPower
-            # actually reaches the charge current calculation. Enabled via
-            # BatterySupportCompensatePgt in config.ini (default: off, to
-            # preserve existing behaviour for anyone already relying on it).
-            # pgt itself is only ever configured directly in the go-e app (see
-            # note above) - it is read here fresh, purely to inform this
-            # compensation, never written.
-            # NOTE: the exact relationship between pgt and the resulting
-            # current reduction has only been empirically observed, not
-            # precisely confirmed as a formula - this compensation is a
-            # reasonable approximation (adding pgt's magnitude), not a
-            # guaranteed exact match.
+            # Optional pgt compensation - see README ("Grid target (pgt)").
             if self._getSetting('BatterySupportCompensatePgt', 0):
               try:
                 pgtData = self._getGoeChargerData('pgt')
@@ -833,20 +632,13 @@ class DbusGoeChargerService:
                 currentPgt = None
               adjustment += abs(currentPgt) if currentPgt is not None else 0
             pGrid -= adjustment
-            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> pGrid adjusted by -%sW virtual surplus%s" %
+            logging.debug("Battery buffer active: SOC=%s%% (threshold %s%%, hysteresis %s%%) -> pGrid adjusted by -%sW virtual surplus%s%s" %
                           (batterySocForSupport, maxSocForSupport, supportHysteresis, adjustment,
-                           " (incl. pgt compensation)" if adjustment != supportPower else ""))
+                           " (incl. pgt compensation)" if adjustment != supportPower else "",
+                           " (force-start tier, PV gate bypassed)" if self._batteryForceStartActive else ""))
       elif self._batterySupportActive:
-        # IMPORTANT (found live): if the feature is disabled via config.ini
-        # (BatterySupportMinSoc or BatterySupportPower set to 0) WHILE it was
-        # previously active, the block above is skipped entirely and this
-        # flag was never being reset - it stayed stuck at True indefinitely
-        # (until leaving Auto mode entirely), even though the code that
-        # would normally re-evaluate and clear it never ran. This didn't
-        # cause a wrong pGrid adjustment (that code is also inside the
-        # skipped block), but the flag and its "active" log messages
-        # misleadingly kept implying the feature was still engaged. Reset
-        # explicitly here instead.
+        # Flag could otherwise get stuck "active" if disabled mid-session -
+        # see README Findings ("Battery buffer: two bugs...").
         self._batterySupportActive = False
         logging.info("Battery buffer disabled via config.ini (BatterySupportMinSoc/Power set to 0) - deactivating")
 
@@ -939,14 +731,9 @@ class DbusGoeChargerService:
           self._dbusservice['/SetCurrent'] = int(data['amp'])
           self._dbusservice['/MaxCurrent'] = int(data['ama'])
 
-          # update chargingTime, increment charge time only on active charging (2), reset when no car connected (1)
-          # Alternatives tested and discarded: go-e's 'cdi' field does not provide a
-          # real-time millisecond value while charging (type=0) - confirmed by test:
-          # unchanged after 60s of active charging - and 'rbt - lcctc' resets on every
-          # PV-triggered charge restart. This local stopwatch is therefore the only
-          # reliable source for the active charging time; it correctly keeps counting
-          # across PV-surplus pauses (no reset on car==4), but is lost on a restart of
-          # this service (a rare edge case).
+          # increment charge time only on active charging (2), reset when no
+          # car connected (1). Local stopwatch, not go-e's 'cdi'/'rbt-lcctc'
+          # fields - see README Findings for why those didn't work.
           timeDelta = time.time() - self._lastUpdate
           carForTiming = int(data['car']) if data['car'] is not None else None
           if carForTiming == 2 and self._lastUpdate > 0:  # vehicle loads
@@ -954,23 +741,13 @@ class DbusGoeChargerService:
           elif carForTiming == 1:  # charging station ready, no vehicle
             self._chargingTime = 0
           self._dbusservice['/ChargingTime'] = int(self._chargingTime)
-          # /Session/Time - this path is read by the Venus OS GUI/VRM for the
-          # "Session" display; /ChargingTime is marked deprecated in the official docs.
+          # /Session/Time - read by the Venus OS GUI/VRM; /ChargingTime is
+          # deprecated in the official docs.
           self._dbusservice['/Session/Time'] = int(self._chargingTime)
 
-          # Detect an external change of phase-switch mode (e.g. the user
-          # switched psm directly in the go-e app, not via the repurposed
-          # /AutoStart toggle in Venus OS). Only react if psm changed
-          # WITHOUT us having set it ourselves last - same pattern as lmo
-          # below. The psm -> /AutoStart mapping depends on AutoStartMode
-          # (see __init__): mode 0 leaves /AutoStart untouched entirely
-          # (the toggle has no function, so there is nothing meaningful to
-          # reflect); modes 1-3 each treat one psm value as "off" (0) and
-          # everything else as "on" (1), matching whichever two states that
-          # mode's toggle actually switches between.
-          # NOTE: deliberately OUTSIDE the EnableChargeControl block below -
-          # /AutoStart, like /StartStop and /SetCurrent, works independently
-          # of that setting.
+          # External psm change detection (e.g. changed directly in the go-e
+          # app) - mirrors /AutoStart to match, depending on AutoStartMode.
+          # Independent of EnableChargeControl, like /AutoStart itself.
           if self._autoStartMode != 0:
             currentPsm = int(data['psm']) if 'psm' in data and data['psm'] is not None else None
             if currentPsm is not None and currentPsm != self._lastCommandedPsm:
@@ -989,11 +766,8 @@ class DbusGoeChargerService:
           # The entire following block (mode sync, PV surplus push) only runs if
           # the new control logic has been explicitly enabled via config.ini.
           if self._chargeControlEnabled:
-            # Detect an external change of charge mode (e.g. the user switched
-            # Eco/Daily Trip/Normal directly in the go-e app, not via Venus
-            # OS). Only react if lmo has changed WITHOUT us having set it
-            # ourselves last. lmo: 4=Eco (Auto), 5=Daily Trip (Scheduled),
-            # anything else (3=default/Basic) -> Manual.
+            # External lmo change detection - lmo: 4=Eco (Auto), 5=Daily
+            # Trip (Scheduled), anything else -> Manual.
             currentLmo = int(data['lmo']) if 'lmo' in data and data['lmo'] is not None else None
             if currentLmo is not None and currentLmo != self._lastCommandedLmo:
               if currentLmo == 4:
@@ -1011,19 +785,13 @@ class DbusGoeChargerService:
 
             # In Auto mode, forward the PV surplus values to the go-e
             if self._chargeMode == 1:
-              # Also cancels any pending zero-flush (see below) - relevant
-              # right after a service restart if the go-e turns out to
-              # already be in Auto: the flush counter defaults to 5 (see
-              # __init__) precisely to catch the "stale averages from before
-              # this restart" case, but must not fire once real values are
-              # confirmed to be flowing.
+              # Cancels any pending zero-flush (relevant after a restart if
+              # the go-e turns out to already be in Auto).
               self._pvResetCyclesRemaining = 0
               self._pushPvSurplusValues()
             elif self._pvResetCyclesRemaining > 0:
-              # Just left Auto: keep pushing zeros for a few cycles so the
-              # go-e's 3-sample rolling averages are fully flushed rather than
-              # staying frozen on stale surplus data (see _applyChargeMode for
-              # the full explanation and the live evidence behind this).
+              # Flushes the go-e's rolling averages after leaving Auto - see
+              # README Findings ("Fresh PV data is pushed...").
               try:
                 payload = json.dumps({"pGrid": 0, "pPv": 0, "pAkku": 0}, separators=(',', ':'))
                 baseURL = "http://%s/api/set" % self._getConfig()['ONPREMISE']['Host']
@@ -1044,59 +812,16 @@ class DbusGoeChargerService:
              else:
                 self._dbusservice['/MCU/Temperature'] = int(data['tmp'])
 
-          # carState, per official go-e API v2 docs (apikeys-de.md):
-          # "null wenn interner Fehler" (Unknown/Error=0, Idle=1, Charging=2,
-          # WaitCar=3, Complete=4, Error=5). IMPORTANT: car can apparently be
-          # None/null itself on an internal error, not just report value 5 -
-          # handled defensively below instead of letting int(None) crash.
-          #
-          # Venus OS /Status (official evcharger dbus spec): 0=Disconnected;
-          # 1=Connected; 2=Charging; 3=Charged; 4=Waiting for sun;
-          # 5=Waiting for RFID; 6=Waiting for start; 7=Low SOC;
-          # 8=Ground fault; 9=Welded contacts; 10=CP Input shorted;
-          # 11=Residual current detected; 12=Under voltage; 13=Overvoltage;
-          # 14=Overheating; 20=Charging limit.
-          #
-          # go-e's 'car' alone cannot distinguish WHY charging is paused while
-          # a vehicle is connected - it could be insufficient PV surplus, an
-          # explicit force-off, RFID required, or a genuinely finished
-          # session, all of which look identical from 'car' alone. go-e's
-          # 'modelStatus' (a detailed "reason why we allow charging or not"
-          # enum) is used here to pick a more specific Venus status, matching
-          # the official go-e API v2 documentation:
-          # https://github.com/goecharger/go-eCharger-API-v2/blob/main/apikeys-de.md
-          #
-          # IMPORTANT (corrected after live testing): the disambiguation must
-          # be applied when car==4, NOT car==3. On this device/firmware, go-e
-          # reports car==4 ("charging finished, vehicle still connected") for
-          # BOTH a genuinely completed session AND for paused/force-off states
-          # - confirmed live: both "gestoppt" (frc=1, modelStatus=4) and "ECO
-          # pausiert" (frc=0, modelStatus=17) showed car==4, not car==3. An
-          # earlier version of this mapping applied the disambiguation to
-          # car==3 instead, which never matched these real-world pause states
-          # in practice - car==4 always fell through to a plain "Charged",
-          # which is what was seen live even while genuinely waiting for PV.
-          #
-          # Only modelStatus 4 (NotChargingBecauseForceStateOff) and 17
-          # (NotChargingBecauseFallbackAwattar) have been directly confirmed
-          # live against this fork's own frc-driven pause states; the RFID
-          # mapping (2) is taken directly from go-e's own documentation but
-          # not separately live-tested here since this fork does not use RFID.
-          # If modelStatus indicates none of these known pause reasons, car==4
-          # falls back to its plain, original meaning: Charged (3).
-          #
-          # car==5 (Error) was previously not handled at all - it silently
-          # fell through to the default status=0 ("Disconnected"), hiding a
-          # real error condition behind a misleading "not connected" display.
-          # go-e's separate 'err' key (documented error reasons: FiAc=1,
-          # FiDc=2, Phase=3, Overvolt=4, Overamp=5, Diode=6, PpInvalid=7,
-          # GndInvalid=8, ContactorStuck=9, ContactorMiss=10, FiUnknown=11,
-          # Unknown=12, Overtemp=13, NoComm=14) is used to pick the closest
-          # matching Venus error status where a reasonably confident mapping
-          # exists. NONE of these error mappings have been live-tested (no
-          # real error condition has occurred during development) - if this
-          # ever triggers, please verify in the go-e app that the displayed
-          # error genuinely matches, and report back if not.
+          # car (go-e): 0=Unknown/Error, 1=Idle, 2=Charging, 3=WaitCar,
+          # 4=Complete, 5=Error (can also be null on an internal error).
+          # Venus /Status: 0=Disconnected, 1=Connected, 2=Charging, 3=Charged,
+          # 4=Waiting for sun, 5=Waiting for RFID, 6=Waiting for start,
+          # 8=Ground fault, 9=Welded contacts, 11=Residual current,
+          # 13=Overvoltage, 14=Overheating.
+          # car==4 needs go-e's modelStatus to disambiguate WHY (paused vs.
+          # genuinely finished) - see README Findings ("Detailed /Status
+          # reporting"). Only modelStatus 4/17 are live-confirmed; err
+          # mappings below are from go-e's own docs, not live-tested.
           carValue = data['car']
           if carValue is None:
             status = 0
@@ -1152,11 +877,8 @@ class DbusGoeChargerService:
           logging.debug("Wallbox Session Energy (/Session/Energy): %s" % (self._dbusservice['/Session/Energy']))
           logging.debug("Wallbox Session Time (/Session/Time): %s" % (self._dbusservice['/Session/Time']))
           logging.debug("Charge mode: %s (lmo=%s)" % ("Auto" if self._chargeMode == 1 else "Manual", currentLmo))
-          # go-e's internal rolling averages of pGrid/pPv/pAkku - logged
-          # regardless of mode, so the reset-push behaviour on leaving Auto
-          # (see _applyChargeMode) can be observed decaying these over time
-          # instead of staying frozen, and so the Eco algorithm's likely
-          # actual decision basis is visible for diagnosis.
+          # Logged regardless of mode, to observe the reset-push decaying
+          # these (see README Findings, "Fresh PV data is pushed...").
           logging.debug("go-e rolling averages: pvopt_averagePGrid=%s pvopt_averagePPv=%s pvopt_averagePAkku=%s" %
                         (data.get('pvopt_averagePGrid'), data.get('pvopt_averagePPv'), data.get('pvopt_averagePAkku')))
           logging.debug("---")
@@ -1170,15 +892,9 @@ class DbusGoeChargerService:
           #update lastupdate vars
           self._lastUpdate = time.time()
        else:
-          # go-e unreachable this cycle (e.g. a mobile wallbox currently not
-          # on a network Venus OS can reach). Reflect this in /Connected so
-          # Venus OS/VRM can show the device as offline instead of silently
-          # freezing on its last known values forever. Only written when it
-          # actually changes, to avoid a redundant write every single failed
-          # cycle while unreachable for an extended period. /Status is also
-          # reset to 0 (Disconnected) for the same reason - leaving it frozen
-          # on e.g. "Charging" while the box is actually gone would be
-          # actively misleading.
+          # go-e unreachable this cycle - reflect in /Connected/Status so
+          # Venus OS/VRM shows it as offline instead of freezing on stale
+          # values. See README Findings ("Detailed /Status reporting").
           if self._dbusservice['/Connected'] != 0:
             logging.info("go-eCharger unreachable - /Connected set to 0")
             self._dbusservice['/Connected'] = 0
@@ -1195,40 +911,21 @@ class DbusGoeChargerService:
     logging.info("someone else updated %s to %s" % (path, value))
 
     if path == '/SetCurrent':
-      # IMPORTANT: this also has to update _lastCommandedAmp, because it writes
-      # the very same 'amp' key that the Auto-mode ceiling logic manages (see
-      # _pushPvSurplusValues). Without this, changing the current in the Venus
-      # OS GUI while in Auto mode would silently lower the ceiling, while the
-      # ceiling logic still believed 'amp' was at the device maximum and
-      # therefore never restored it - leaving the Eco algorithm permanently
-      # capped at whatever was set here. Keeping the tracker in sync means the
-      # next Auto cycle notices the discrepancy and raises the ceiling again.
+      # Also updates _lastCommandedAmp, since this writes the same 'amp' key
+      # the Auto-mode ceiling logic manages - see README Findings ("Other
+      # robustness findings").
       ok = self._setGoeChargerValueV2('amp', int(value))
       if ok:
         self._lastCommandedAmp = int(value)
       return ok
     elif path == '/StartStop':
-      # NOTE: writing 'alw' directly via a plain query parameter returns
-      # HTTP 500 ("tried to set api key without setter") - the same error
-      # pattern seen with pGrid/pPv/pAkku early on. 'alw' therefore appears to
-      # need the ids={} form, but doing so gets silently reverted by the go-e's
-      # own Eco algorithm within moments (the very problem 'frc' was
-      # introduced to solve). Live testing showed that 'frc' alone - without
-      # ever successfully writing 'alw' - was sufficient for charging to
-      # actually start (with an observed ~30s delay, matching the go-e's
-      # general PV-surplus-mode startup timing measured elsewhere - this may
-      # be an inherent ramp-up/handshake delay in the charger itself, not
-      # something dependent on 'alw'). 'alw' is therefore no longer written
-      # here at all.
+      # 'alw' is not written - 'frc' alone is sufficient. See README Findings
+      # ("API endpoint quirks").
       enable = bool(int(value))
       return self._setFrc(0 if enable else 1)
     elif path == '/AutoStart':
-      # DELIBERATELY REPURPOSED (see paths dict comment in main() and
-      # README): this is NOT Victron's official "start automatically when a
-      # vehicle is connected" semantic. What it actually does depends on
-      # AutoStartMode from config.ini (read once at startup, see __init__):
-      # 0 = disabled, no function at all; 1 = "1P-Auto"; 2 = "3P-Auto";
-      # 3 = "1P-3P". See __init__ for the full mapping.
+      # Repurposed - see README ("/AutoStart repurposed..."). Behaviour
+      # depends on AutoStartMode (read once at startup, see __init__).
       if self._autoStartMode == 0:
         return True
       enable = bool(int(value))
@@ -1265,18 +962,9 @@ def main():
                             datefmt='%Y-%m-%d %H:%M:%S',
                             level=logging_level,
                             handlers=[
-                                # backupCount is REQUIRED for rotation to
-                                # actually happen: with maxBytes set but
-                                # backupCount at its default of 0, Python's
-                                # RotatingFileHandler never rotates at all and
-                                # the file grows without limit (verified: a
-                                # 1000-byte limit produced a 25kB file). On a
-                                # space-constrained GX device running at
-                                # Logging=DEBUG with a 5s poll interval, that
-                                # adds up. maxBytes also raised from the
-                                # original 10kB, which is small enough that
-                                # useful context scrolls out of the log within
-                                # a minute or two at DEBUG level.
+                                # backupCount required, else rotation never
+                                # happens - see README Findings ("Other
+                                # robustness findings").
                                 RotatingFileHandler("%s/current.log" % (os.path.dirname(os.path.realpath(__file__))), maxBytes=2000000, backupCount=3),
                                 logging.StreamHandler()
                             ])
