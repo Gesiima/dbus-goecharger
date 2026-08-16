@@ -666,11 +666,15 @@ solve this either. Two lighter-weight improvements were added instead,
 without going as far as continuous monitoring:
 
 - **External changes to `MinimumSocLimit` while the lock is active are
-  detected and respected**, rather than silently being overwritten by the
-  stale value recorded when the lock was first applied - if you (or
-  something else) manually change it mid-session, that new value becomes
-  what gets restored later, and the lock is re-applied on top of it using
-  the current SOC.
+  detected and respected** - concretely: if you (or something else) change
+  it manually mid-session, your new value is visible only until the next
+  cycle (within one `PauseBetweenRequests` interval, so a few seconds) -
+  at that point it gets overwritten again with the current SOC, same as
+  always while charging continues, so the lock keeps working exactly as
+  before. What changes is which value gets restored once charging actually
+  stops: it's now *your* new value, not the stale one recorded when the
+  lock was first applied. In short - your edit doesn't "stick" while
+  charging is still ongoing, but it is remembered for when it ends.
 - **`CheckEssMinSocAtStartup` + `ExpectedEssMinSoc`**: an optional,
   one-time check at every service start - if the actual `MinimumSocLimit`
   doesn't match what you've configured as your normal value, this is
