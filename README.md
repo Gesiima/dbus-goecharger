@@ -143,6 +143,22 @@ Phase switching (1/3-phase) is deliberately left to the go-e's own firmware
 logic (`psm`, `spl3`) and is not manipulated by this script beyond the
 `/AutoStart` override above.
 
+**⚠️ Not verified safe on older (API v1) go-e hardware - potential flash
+wear risk.** This entire fork was developed and tested exclusively against
+a go-e V4 running API v2 firmware, where flash write-cycle limitations were
+officially confirmed to no longer apply (see "API endpoint quirks" in
+Findings below). This fork writes frequently and without any built-in
+limit: `amp`/`frc`/`psm` whenever their target value changes, and
+`pGrid`/`pPv`/`pAkku` roughly every 5 seconds continuously while in Auto
+mode. **Older go-e hardware/firmware (API v1) is documented elsewhere to
+have genuine flash write-cycle concerns for at least some of these same
+keys** - this fork has no version check, no rate-limiting beyond
+change-detection, and no safeguard of any kind against this. If you're
+running older hardware, verify independently whether these concerns
+still apply to your specific device/firmware before enabling
+`EnableChargeControl` - this fork provides no protection against flash
+wear on such hardware.
+
 **Visible startup confirmation even at `Logging = WARN`:** at `WARN`,
 essentially all other logging is filtered out - a restarted service left no
 confirmation that it had actually started successfully. One line is logged
@@ -172,7 +188,9 @@ default and can be safely omitted.
 - **`HardwareVersion`** *(restart)*: go-e hardware generation. Only affects the
   temperature reading (`/MCU/Temperature`) - energy calculation (`eto`) is
   handled uniformly via the API v2 unit (Wh) in this fork, since
-  `/api/status` always returns API v2 data.
+  `/api/status` always returns API v2 data. **If your device predates API
+  v2 (older API v1 hardware), see the flash-wear warning under
+  "Restrictions" above before enabling `EnableChargeControl`.**
 - **`AcPosition`** *(restart)*: `0` = AC Output (critical loads), `1` = AC Input.
 - **`Logging`** *(restart)*: `DEBUG`/`INFO`/`WARN`/etc. At `WARN`, one line is still
   logged on successful startup regardless of this setting - see
@@ -796,9 +814,12 @@ and never writes it.
   exist on this device's API v2 firmware at all - confirmed absent via both
   a filtered and a full status dump. Not a bug: an official go-e developer
   confirmed in [API-v2#112](https://github.com/goecharger/go-eCharger-API-v2/issues/112)
-  that flash write-cycle limitations were fully resolved across the board -
-  `amp` can simply be used directly on API v2, exactly as
+  that flash write-cycle limitations were fully resolved **on API v2** -
+  `amp` can simply be used directly there, exactly as
   [evcc's own source code does](https://github.com/evcc-io/evcc/blob/main/charger/go-e.go).
+  **This confirmation is specific to API v2 and has not been verified for
+  older API v1 hardware** - see the dedicated warning under "Restrictions"
+  below before using this fork on older devices.
 
 ### HTTP connection handling (tried Session reuse, reverted)
 
