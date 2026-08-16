@@ -142,6 +142,7 @@ def main():
     #   argv[4] = BatterySupportMinSoc,  argv[5] = its hysteresis
     #   argv[6] = PreventBatteryDischarge (0/1)
     #   argv[7] = current /Settings/CGwacs/BatteryLife/MinimumSocLimit (from dbus), or empty
+    #   argv[8] = BatteryForceStartSoc,   argv[9] = BatterySupportMinPv
     soc = fmt_soc(sys.argv[1]) if len(sys.argv) > 1 else None
     prioMinSoc = float(sys.argv[2]) if len(sys.argv) > 2 else 0
     prioHyst = float(sys.argv[3]) if len(sys.argv) > 3 else 0
@@ -149,6 +150,8 @@ def main():
     supportHyst = float(sys.argv[5]) if len(sys.argv) > 5 else 0
     dischargeLockEnabled = sys.argv[6] == "1" if len(sys.argv) > 6 else False
     essMinSoc = fmt_soc(sys.argv[7]) if len(sys.argv) > 7 else None
+    forceStartSoc = float(sys.argv[8]) if len(sys.argv) > 8 else 0
+    supportMinPv = float(sys.argv[9]) if len(sys.argv) > 9 else 0
 
     try:
         d = json.load(sys.stdin)
@@ -205,6 +208,23 @@ def main():
             supportState = "at/above" if soc >= supportMinSoc else "below"
             print("          Battery: {} SOC | Support>={:.0f}%(-{:.0f}) -> {} threshold (approx., no hysteresis state)".format(
                 socTxt, supportMinSoc, supportHyst, supportState))
+            # ForceStart and MinPv are two separate, independent conditions
+            # within the buffer feature - shown here since neither is
+            # otherwise visible: ForceStart (if its SOC threshold is met)
+            # bypasses the MinPv gate entirely; without ForceStart, MinPv
+            # alone decides whether the buffer's virtual surplus is applied
+            # even though the SOC threshold above is satisfied.
+            if forceStartSoc > 0:
+                forceStartState = "at/above threshold (PV gate bypassed)" if soc >= forceStartSoc else "below threshold"
+                print("          Battery: {} SOC | ForceStart>={:.0f}% -> {}".format(
+                    socTxt, forceStartSoc, forceStartState))
+            if supportMinPv > 0:
+                if ppv is None:
+                    pvGateState = "unknown (pPv not available)"
+                else:
+                    pvGateState = "PASS (real PV sufficient)" if ppv >= supportMinPv else "BLOCKED (real PV below MinPv)"
+                print("          Battery buffer PV gate: pPv={} vs MinPv={:.0f}W -> {}".format(
+                    fmt_w(ppv), supportMinPv, pvGateState))
     else:
         print("          Battery: SOC not available (dbus query failed or not run on Venus OS)")
 
@@ -251,13 +271,15 @@ fetch_and_print() {
   # Thresholds are read fresh on every refresh (not once at startup), so that
   # editing config.ini while -w is running shows up in the next output line -
   # matching the main script, which also applies these live without a restart.
-  local prioMinSoc prioHyst supportMinSoc supportHyst dischargeLockEnabled
+  local prioMinSoc prioHyst supportMinSoc supportHyst dischargeLockEnabled forceStartSoc supportMinPv
   prioMinSoc=$(get_ini_value "BatteryPriorityMinSoc" "0")
   prioHyst=$(get_ini_value "BatteryPriorityHysteresis" "2")
   supportMinSoc=$(get_ini_value "BatterySupportMinSoc" "0")
   supportHyst=$(get_ini_value "BatterySupportHysteresis" "2")
   dischargeLockEnabled=$(get_ini_value "PreventBatteryDischarge" "0")
-  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc"
+  forceStartSoc=$(get_ini_value "BatteryForceStartSoc" "0")
+  supportMinPv=$(get_ini_value "BatterySupportMinPv" "0")
+  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc" "$forceStartSoc" "$supportMinPv"
 }
 
 if [ "$1" == "-w" ]; then
