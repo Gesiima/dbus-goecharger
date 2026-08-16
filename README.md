@@ -290,7 +290,11 @@ reasoning. This script still reads the current value (only for
   `/Mode` switch or an externally-detected go-e app mode change. A manual
   change to `MinimumSocLimit` directly in the Venus OS GUI while the lock
   is already active is detected and adopted as the new
-  value to restore to later, rather than being silently overwritten.
+  value to restore to later, rather than being silently overwritten. **Note:**
+  this only governs the ESS inverter's discharge behaviour - DC-coupled PV
+  can still charge the battery normally while the lock is active, with that
+  energy unavailable to the car for the rest of the session; see "Findings"
+  below.
 - **`CheckEssMinSocAtStartup`** *(restart)*: `0` or omit = disabled (default). When `1`,
   `ExpectedEssMinSoc` (below) is compared once at every service start
   against the actual `/Settings/CGwacs/BatteryLife/MinimumSocLimit`; a mismatch is treated
@@ -710,6 +714,24 @@ returned exactly `62.7`, not rounded to `62`/`63`. This confirms this
 fork's approach - writing whatever `/Dc/Battery/Soc` reports, which is
 itself already limited to one decimal place by Venus OS - is safe as-is,
 with no additional rounding needed before writing it.
+
+**Known limitation, not addressed by this fork: DC-coupled PV can still end
+up "trapped" in the battery instead of reaching the car.** `MinimumSocLimit`
+governs the ESS inverter's own charge/discharge behaviour - it does not
+instruct DC-coupled solar chargers (MPPTs wired directly to the battery) to
+do anything differently. Observed live: while manually charging with the
+lock active, real DC-coupled PV production kept charging the battery as
+normal (independent MPPT logic, unaware of the lock), while the inverter
+itself couldn't then discharge that same energy back out to help power the
+car, due to the lock. The PV energy is not lost, but it ends up going into
+the battery rather than being available to the car for the remainder of
+that charging session - an outcome this fork's own installation (modest
+DC-coupled PV) finds acceptable, but installations with substantial
+DC-coupled PV capacity may reasonably judge differently, since a
+meaningful amount of same-day solar could be diverted away from the car
+this way. No fix is provided for this - doing so would require directly
+managing the DC-coupled chargers' own behaviour, a materially bigger scope
+than anything else in this fork.
 
 ### Phase-switch anti-flapping lock (`mptwt`) can cause a stop/start loop
 
