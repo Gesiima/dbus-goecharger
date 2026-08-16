@@ -351,6 +351,17 @@ else is actively re-read every Auto-mode cycle (or, for
 `PreventBatteryDischarge`, every cycle regardless of mode) without
 needing a restart at all.
 
+### Compact per-cycle debug state line
+
+At `Logging = DEBUG`, every cycle also logs a single summary line:
+`State: car=<X> SOC=<X>% amp_ceiling=<X> frc=<X> ESS_MinSoc=<X>% flags=[...]`.
+Everything else is logged only once per value or only on change, so
+reconstructing the full picture at one point in time previously meant
+cross-referencing several separate log lines, or falling back to
+`pvcheck.sh` alongside the log. This line exists purely to make deep
+troubleshooting from the log alone possible - it has no effect on
+behaviour.
+
 ## Findings
 
 Everything below was found through live testing against one specific device
@@ -358,14 +369,19 @@ Everything below was found through live testing against one specific device
 other firmware/hardware versions. Grouped by subsystem, in roughly the
 order these were discovered.
 
-**Firmware note:** all findings below were established against firmware
-`60.6`. This installation has since switched to `59.4` (the current
-**stable** release - `60.6` was itself a go-e beta, deliberately moved away
-from in favor of stable; only Venus OS currently still runs a beta, kept
-for now specifically because of a Shelly integration limitation unrelated
-to this fork). No functional issues are expected on `59.4`, but this has
-not yet been independently re-verified against the findings below - treat
-anything here as provisional until confirmed on `59.4` specifically.
+**Firmware note:** all findings below were originally established against
+firmware `60.6`. This installation has since switched to `59.4` (the
+current **stable** release - `60.6` was itself a go-e beta, deliberately
+moved away from in favor of stable; only Venus OS currently still runs a
+beta, kept for now specifically because of a Shelly integration limitation
+unrelated to this fork). **Confirmed on `59.4` through dedicated live
+re-testing** covering: Auto/Manual/Scheduled mode switching (both via
+Venus OS and directly in the go-e app), the amp ceiling, start/stop
+surplus timing, the full `PreventBatteryDischarge` lifecycle, the battery
+buffer including its force-start tier, and battery-priority pausing. One
+genuine regression was found and fixed in the process (see "switching
+modes directly in the go-e app skipped this reset entirely" below) -
+otherwise no behavioural differences from `60.6` were found.
 
 ### `amp` is a CEILING, not the live-regulated current
 
@@ -445,6 +461,20 @@ fixed, and the underlying pattern was then generalized:
    when the desired value differs from that tracked value. Switching
    Auto -> Manual -> Scheduled -> Auto while `frc` stays logically `0`
    throughout now produces zero writes and zero clicks.
+4. **Found live: the global tracking in fix 3 was itself incomplete for
+   genuine mode switches.** Auto paused by battery priority (`frc=1`
+   already commanded there) -> switched to Manual while not actively
+   charging (`frc=1` desired again, per fix 2 above) -> `_setFrc()` saw
+   the value as unchanged from the *previous* mode and skipped the write
+   entirely - the go-e then started charging anyway within seconds. The
+   go-e appears to evaluate `frc` per mode context rather than as a value
+   that reliably persists across an `lmo` change, so an assertion made
+   under the old mode cannot be assumed to still hold once a genuinely new
+   mode has been entered. **Fixed** by resetting the tracked value at the
+   start of every mode switch (`_applyChargeMode()`), so the mode-specific
+   `frc` value is now always freshly (re-)written on every actual switch,
+   while the within-mode skip-if-unchanged behaviour from fix 3 (e.g.
+   repeated Auto cycles while priority state doesn't change) is preserved.
 
 ### PV/grid reading: explicit L1+L2+L3 summing, no aggregate "Total" path
 

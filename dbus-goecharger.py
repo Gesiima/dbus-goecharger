@@ -468,9 +468,23 @@ class DbusGoeChargerService:
     see README Findings ("API endpoint quirks") for why.
     '''
     try:
+      # Found live: a mode switch must always freshly re-assert 'frc',
+      # even if the desired value happens to match what we last commanded
+      # in the PREVIOUS mode. Confirmed live: Auto paused by battery
+      # priority (frc=1 already commanded there) -> switched to Manual
+      # while not actively charging (frc=1 desired again) -> _setFrc()
+      # saw the value as unchanged and skipped the write entirely -> the
+      # go-e started charging anyway seconds later. The go-e appears to
+      # evaluate 'frc' per mode context, not globally across an 'lmo'
+      # change, so an old assertion from a different mode cannot be
+      # relied on to still apply. Resetting the tracker here forces the
+      # frc write below to always actually happen on every mode switch.
+      self._lastCommandedFrc = None
+
       # The actual 'frc' value for the new mode is set further below via
       # _setFrc(), which only writes (and only clicks the relay) if the
-      # value actually needs to change.
+      # value actually needs to change relative to what THIS method itself
+      # has already written earlier in the same call.
       if self._chargeMode != 1:
         self._resetAutoModeState()
 
@@ -1052,6 +1066,28 @@ class DbusGoeChargerService:
           # these (see README Findings, "Fresh PV data is pushed...").
           logging.debug("go-e rolling averages: pvopt_averagePGrid=%s pvopt_averagePPv=%s pvopt_averagePAkku=%s" %
                         (data.get('pvopt_averagePGrid'), data.get('pvopt_averagePPv'), data.get('pvopt_averagePAkku')))
+          # Single, compact per-cycle state summary for detailed debugging -
+          # everything above is logged only once per value or only when it
+          # changes, so reconstructing the FULL picture at one point in time
+          # (car state, actual SOC, currently-commanded amp/frc, the live
+          # ESS MinimumSocLimit, and which internal feature flags are
+          # currently active) previously required cross-referencing several
+          # separate log lines, or falling back to pvcheck.sh. This line
+          # exists purely for troubleshooting and has no effect on behaviour.
+          activeFlags = []
+          if self._batteryPriorityPaused:
+            activeFlags.append('priority_paused')
+          if self._batterySupportActive:
+            activeFlags.append('support_active')
+          if self._batteryForceStartActive:
+            activeFlags.append('force_start_active')
+          if self._savedEssMinSoc is not None:
+            activeFlags.append('discharge_lock_active')
+          currentSocForLog = self._safeGetValue(self._batterySocItem, '/Dc/Battery/Soc')
+          currentEssMinSocForLog = self._safeGetValue(self._essMinSocItem, '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
+          logging.debug("State: car=%s SOC=%s%% amp_ceiling=%s frc=%s ESS_MinSoc=%s%% flags=%s" %
+                        (data.get('car'), currentSocForLog, self._lastCommandedAmp, self._lastCommandedFrc,
+                         currentEssMinSocForLog, activeFlags if activeFlags else 'none'))
           logging.debug("---")
 
           # increment UpdateIndex - to show that new data is available
