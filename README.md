@@ -61,6 +61,9 @@ monitoring only, `/Mode` stays read-only.
   SOC, this applies unconditionally even with zero PV.
 - **`/AutoStart` repurposed as a configurable phase-switching override** -
   see its own section below (works independently of `EnableChargeControl`).
+- **Prevent home battery discharge during Manual/Scheduled charging** -
+  optional, mirrors an equivalent evcc feature; see "Configuration
+  reference" and "Findings" below.
 - **Sync on external change:** if the mode (or, for `/AutoStart`, `psm`) is
   changed directly in the go-e app, the corresponding Venus OS path follows
   automatically.
@@ -596,7 +599,10 @@ direct hold/charge/discharge mode command, e.g. via Modbus). Without that,
 any system's ESS will physically balance a momentary production/demand gap
 from the battery regardless of what any external controller "intends" -
 this fork's settings control what *this script itself* signals to the go-e,
-not the underlying physical behaviour of the Multiplus/ESS system.
+not the underlying physical behaviour of the Multiplus/ESS system. (The
+same underlying limitation, applied to a different feature, resurfaces
+below as the DC-coupled PV note under "Preventing battery discharge during
+Manual charging".)
 
 ### Preventing battery discharge during Manual charging: three mechanisms considered
 
