@@ -37,7 +37,7 @@ Shows: charging status, reason (modelStatus), phase-switch mode (psm),
 live charging power/current, pGrid/pPv/pAkku, the go-e's internal rolling
 averages of those three, the home battery SOC alongside the configured
 BatteryPriorityMinSoc/BatterySupportMinSoc thresholds, and (if
-PreventBatteryDischargeInManual is enabled) the current ESS
+PreventBatteryDischarge is enabled) the current ESS
 MinimumSocLimit alongside a best-effort guess at whether the discharge
 lock is likely active - all decoded to readable labels.
 
@@ -140,7 +140,7 @@ def main():
     #   argv[1] = actual battery SOC (from dbus), or empty if unavailable
     #   argv[2] = BatteryPriorityMinSoc, argv[3] = its hysteresis
     #   argv[4] = BatterySupportMinSoc,  argv[5] = its hysteresis
-    #   argv[6] = PreventBatteryDischargeInManual (0/1)
+    #   argv[6] = PreventBatteryDischarge (0/1)
     #   argv[7] = current /Settings/CGwacs/BatteryLife/MinimumSocLimit (from dbus), or empty
     soc = fmt_soc(sys.argv[1]) if len(sys.argv) > 1 else None
     prioMinSoc = float(sys.argv[2]) if len(sys.argv) > 2 else 0
@@ -210,7 +210,7 @@ def main():
 
     # ESS MinimumSocLimit is always shown (useful diagnostic on its own,
     # e.g. to see your normal baseline), with the "likely active/inactive"
-    # guess only added if PreventBatteryDischargeInManual is enabled.
+    # guess only added if PreventBatteryDischarge is enabled.
     # NOTE: same caveat as above - this can't be a guaranteed live match to
     # the running script's actual internal state (_savedEssMinSoc, not
     # exposed on dbus) - e.g. right after the car stops charging, the real
@@ -220,13 +220,13 @@ def main():
     if dischargeLockEnabled:
         modeTxt = MODE.get(lmo, "Manual")
         if car == 2 and modeTxt in ("Manual", "Scheduled"):
-            print("          ESS MinimumSocLimit: {} | PreventBatteryDischargeInManual=1 -> "
+            print("          ESS MinimumSocLimit: {} | PreventBatteryDischarge=1 -> "
                   "likely ACTIVE (charging in {})".format(essTxt, modeTxt))
         else:
-            print("          ESS MinimumSocLimit: {} | PreventBatteryDischargeInManual=1 -> "
+            print("          ESS MinimumSocLimit: {} | PreventBatteryDischarge=1 -> "
                   "likely inactive (not charging in Manual/Scheduled)".format(essTxt))
     else:
-        print("          ESS MinimumSocLimit: {} (PreventBatteryDischargeInManual disabled)".format(essTxt))
+        print("          ESS MinimumSocLimit: {} (PreventBatteryDischarge disabled)".format(essTxt))
 
     print("-" * 70)
 
@@ -256,7 +256,7 @@ fetch_and_print() {
   prioHyst=$(get_ini_value "BatteryPriorityHysteresis" "2")
   supportMinSoc=$(get_ini_value "BatterySupportMinSoc" "0")
   supportHyst=$(get_ini_value "BatterySupportHysteresis" "2")
-  dischargeLockEnabled=$(get_ini_value "PreventBatteryDischargeInManual" "0")
+  dischargeLockEnabled=$(get_ini_value "PreventBatteryDischarge" "0")
   echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc"
 }
 
