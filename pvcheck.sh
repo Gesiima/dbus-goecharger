@@ -143,6 +143,7 @@ def main():
     #   argv[6] = PreventBatteryDischarge (0/1)
     #   argv[7] = current /Settings/CGwacs/BatteryLife/MinimumSocLimit (from dbus), or empty
     #   argv[8] = BatteryForceStartSoc,   argv[9] = BatterySupportMinPv
+    #   argv[10] = ExpectedEssMinSoc (from config.ini), or empty if unset
     soc = fmt_soc(sys.argv[1]) if len(sys.argv) > 1 else None
     prioMinSoc = float(sys.argv[2]) if len(sys.argv) > 2 else 0
     prioHyst = float(sys.argv[3]) if len(sys.argv) > 3 else 0
@@ -152,6 +153,7 @@ def main():
     essMinSoc = fmt_soc(sys.argv[7]) if len(sys.argv) > 7 else None
     forceStartSoc = float(sys.argv[8]) if len(sys.argv) > 8 else 0
     supportMinPv = float(sys.argv[9]) if len(sys.argv) > 9 else 0
+    expectedEssMinSoc = fmt_soc(sys.argv[10]) if len(sys.argv) > 10 else None
 
     try:
         d = json.load(sys.stdin)
@@ -239,7 +241,27 @@ def main():
     essTxt = "{:.1f}%".format(essMinSoc) if essMinSoc is not None else "n/a"
     if dischargeLockEnabled:
         modeTxt = MODE.get(lmo, "Manual")
-        if car == 2 and modeTxt in ("Manual", "Scheduled"):
+        # Prefer a DIRECT comparison against the known baseline
+        # (ExpectedEssMinSoc) when available - this reads the actual
+        # current dbus value against a fixed reference point, rather than
+        # inferring "should be active" from a separate, independently-timed
+        # go-e HTTP snapshot (car/lmo). Found live: during a fast
+        # transition, the two snapshots (go-e API call, Venus dbus call)
+        # can legitimately be a cycle apart - e.g. the real script had
+        # already restored MinimumSocLimit to baseline, while this
+        # snapshot's own car/lmo read still reflected the moment before -
+        # showing "likely ACTIVE" despite the value already being back at
+        # baseline. Comparing directly against the known baseline value
+        # sidesteps that mismatch entirely.
+        if expectedEssMinSoc is not None and essMinSoc is not None:
+            atBaseline = abs(essMinSoc - expectedEssMinSoc) < 0.05
+            if atBaseline:
+                print("          ESS MinimumSocLimit: {} | PreventBatteryDischarge=1 -> "
+                      "inactive (matches configured baseline {:.1f}%)".format(essTxt, expectedEssMinSoc))
+            else:
+                print("          ESS MinimumSocLimit: {} | PreventBatteryDischarge=1 -> "
+                      "ACTIVE (differs from configured baseline {:.1f}%)".format(essTxt, expectedEssMinSoc))
+        elif car == 2 and modeTxt in ("Manual", "Scheduled"):
             print("          ESS MinimumSocLimit: {} | PreventBatteryDischarge=1 -> "
                   "likely ACTIVE (charging in {})".format(essTxt, modeTxt))
         else:
@@ -271,7 +293,7 @@ fetch_and_print() {
   # Thresholds are read fresh on every refresh (not once at startup), so that
   # editing config.ini while -w is running shows up in the next output line -
   # matching the main script, which also applies these live without a restart.
-  local prioMinSoc prioHyst supportMinSoc supportHyst dischargeLockEnabled forceStartSoc supportMinPv
+  local prioMinSoc prioHyst supportMinSoc supportHyst dischargeLockEnabled forceStartSoc supportMinPv expectedEssMinSoc
   prioMinSoc=$(get_ini_value "BatteryPriorityMinSoc" "0")
   prioHyst=$(get_ini_value "BatteryPriorityHysteresis" "2")
   supportMinSoc=$(get_ini_value "BatterySupportMinSoc" "0")
@@ -279,7 +301,8 @@ fetch_and_print() {
   dischargeLockEnabled=$(get_ini_value "PreventBatteryDischarge" "0")
   forceStartSoc=$(get_ini_value "BatteryForceStartSoc" "0")
   supportMinPv=$(get_ini_value "BatterySupportMinPv" "0")
-  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc" "$forceStartSoc" "$supportMinPv"
+  expectedEssMinSoc=$(get_ini_value "ExpectedEssMinSoc" "")
+  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc" "$forceStartSoc" "$supportMinPv" "$expectedEssMinSoc"
 }
 
 if [ "$1" == "-w" ]; then
