@@ -528,10 +528,17 @@ very differently despite both being reachable from a "Scheduled"-sounding
 selector. All three Venus OS modes now explicitly *disable* the weekly timer
 - if you want to use it, it must be managed directly in the go-e app.
 
-(Writing the timer object back, when it was still used, initially failed
-with `ESP_ERR_HTTPD_RESULT_TRUNC` - the go-e's ESP32 HTTP server has a
-limited request buffer. Fixed by encoding the JSON compactly, saving ~30
-characters per call.)
+(Writing the full timer object back initially failed with
+`ESP_ERR_HTTPD_RESULT_TRUNC` - the go-e's ESP32 HTTP server has a limited
+request buffer. Compact JSON encoding was tried first and reduced but did
+**not** eliminate this - confirmed live: 100% reproducible on every single
+mode switch, 18 failures across 6 switches in one test session, even with
+compact encoding. **Properly fixed** by confirming live via direct `curl`
+testing that the go-e accepts a minimal payload containing only `control`,
+without `ranges` at all - and that the existing ranges remain completely
+unchanged afterwards. No need to read the current object first at all
+anymore; this is both simpler and reliably small enough to stay under the
+buffer limit.)
 
 **Not extensively live-tested** - unlike Auto and Manual, which were both
 tested extensively over many live sessions, Scheduled mode has no real use
@@ -596,6 +603,19 @@ the very same cycle the average finally updated, not when the real value
 changed. This confirms the averaging behaviour is a general property of how
 the Eco algorithm evaluates surplus, not something specific to the Auto/
 Manual transition case above.
+
+**Found live: switching modes directly in the go-e app skipped this reset
+entirely.** The Auto-mode state reset (including the rolling-average
+flush, plus clearing battery-priority/support/force-start flags and the
+`amp` ceiling tracker) lived only inside the explicit-switch code path
+(`_applyChargeMode()`, triggered by a Venus OS `/Mode` write) - the
+separate external-lmo-change-detection path in `_update()` only updated
+`self._chargeMode` and the displayed `/Mode` value, without ever running
+this reset. Switching Auto -> Manual directly in the go-e app therefore
+silently skipped the flush (and the other resets) - confirmed live.
+**Fixed** by extracting the reset into its own method and calling it from
+both trigger paths, so it now runs identically regardless of whether the
+mode change came from Venus OS or was detected from the go-e app.
 
 ### Battery buffer: two bugs found after adding `BatterySupportMinSoc`
 

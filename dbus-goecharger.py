@@ -405,29 +405,26 @@ class DbusGoeChargerService:
   def _setGoeSchedulerEnabled(self, enabled):
     '''
     Enables/disables the go-e's own weekly schedule (sch_week/sch_satur/sch_sund)
-    without changing the time windows (ranges) configured there in the app. To do
-    this, the current object is read, only 'control' is changed, and the whole
-    object is written back - the times remain exactly as set in the go-e app.
+    without changing the time windows (ranges) configured there in the app.
     control: Disabled=0, Inside=1, Outside=2 (we only use 0/1)
 
-    IMPORTANT: uses compact JSON encoding (no whitespace after ':'/',') - the
-    default json.dumps() output previously caused this call to fail with
-    "ESP_ERR_HTTPD_RESULT_TRUNC" (URL too long for the go-e's small ESP32 HTTP
-    server buffer). Compact encoding saves ~30 characters per call, which may
-    be enough to stay under that limit - if it still fails on devices with
-    more configured time ranges, the URL may simply be too long regardless.
+    IMPORTANT (found live): sending the full object back (reading the
+    current one, changing only 'control', writing the whole thing back)
+    reliably failed with "ESP_ERR_HTTPD_RESULT_TRUNC" (URL too long for the
+    go-e's small ESP32 HTTP server buffer) - confirmed 100% reproducible
+    across every mode switch, even with compact JSON encoding (an earlier
+    fix attempt that reduced but did not eliminate the problem). Confirmed
+    live via direct curl testing that the go-e accepts a MINIMAL payload
+    containing only 'control', without 'ranges' at all, AND that the
+    existing ranges remain completely unchanged afterwards - no need to
+    read/resend the current object at all. This is simpler (no extra GET
+    per key) and reliably small enough to stay under the buffer limit.
     '''
     control = 1 if enabled else 0
     config = self._getConfig()
     for key in ('sch_week', 'sch_satur', 'sch_sund'):
       try:
-        current = self._getGoeChargerData(key)
-        if current is None or key not in current or current[key] is None:
-          logging.warning("Scheduler: %s not available, skipping" % key)
-          continue
-        schedObj = current[key]
-        schedObj['control'] = control
-        payload = json.dumps({key: schedObj}, separators=(',', ':'))
+        payload = json.dumps({key: {'control': control}}, separators=(',', ':'))
         baseURL = "http://%s/api/set" % config['ONPREMISE']['Host']
         request_data = requests.get(url=baseURL, params={'ids': payload}, timeout=2)
         if not request_data or not getattr(request_data, 'ok', True):
@@ -436,6 +433,27 @@ class DbusGoeChargerService:
       except Exception as e:
         logging.critical('Error at %s', '_setGoeSchedulerEnabled(%s)' % key, exc_info=e)
 
+
+  def _resetAutoModeState(self):
+    '''
+    Resets Auto-mode-specific state when leaving Auto (self._chargeMode is
+    already set to the new target mode by the caller before this runs).
+    Extracted into its own method so it can be called from BOTH triggering
+    paths: an explicit Venus OS /Mode switch (via _applyChargeMode) AND an
+    externally-detected go-e app mode change (in _update()) - found live
+    (see README Findings) that switching modes directly in the go-e app
+    only went through the latter path, which previously skipped this reset
+    entirely (including the rolling-average flush), silently leaving stale
+    state in place.
+    '''
+    self._batteryPriorityPaused = False
+    self._batterySupportActive = False
+    self._batteryForceStartActive = False
+    self._lastCommandedAmp = None
+    # Flushes the go-e's internal rolling averages, which otherwise stay
+    # frozen while not in Auto - see README Findings ("Fresh PV data is
+    # pushed..."). Configurable via PvAverageResetCycles, default 0.
+    self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 0)
 
   def _applyChargeMode(self):
     '''
@@ -450,19 +468,11 @@ class DbusGoeChargerService:
     see README Findings ("API endpoint quirks") for why.
     '''
     try:
-      # Reset Auto-mode-specific state when leaving Auto - the actual 'frc'
-      # value for the new mode is set further below via _setFrc(), which
-      # only writes (and only clicks the relay) if the value actually needs
-      # to change.
+      # The actual 'frc' value for the new mode is set further below via
+      # _setFrc(), which only writes (and only clicks the relay) if the
+      # value actually needs to change.
       if self._chargeMode != 1:
-        self._batteryPriorityPaused = False
-        self._batterySupportActive = False
-        self._batteryForceStartActive = False
-        self._lastCommandedAmp = None
-        # Flushes the go-e's internal rolling averages, which otherwise stay
-        # frozen while not in Auto - see README Findings ("Fresh PV data is
-        # pushed..."). Configurable via PvAverageResetCycles, default 0.
-        self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 0)
+        self._resetAutoModeState()
 
       if self._chargeMode == 1:
         # Entering Auto - cancel any pending zero-flush from a previous exit,
@@ -934,6 +944,8 @@ class DbusGoeChargerService:
                               (currentLmo, {1: "Auto", 2: "Scheduled"}.get(newChargeMode, "Manual")))
                 self._chargeMode = newChargeMode
                 self._dbusservice['/Mode'] = self._chargeMode
+                if self._chargeMode != 1:
+                  self._resetAutoModeState()
               self._lastCommandedLmo = currentLmo
 
             # In Auto mode, forward the PV surplus values to the go-e
