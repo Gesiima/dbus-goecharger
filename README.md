@@ -163,21 +163,21 @@ code-level fallback for any of them, so the service will crash on startup if
 one is missing. Every other setting in this document has a code-level
 default and can be safely omitted.
 
-- **`AccessType`**: always `OnPremise`.
-- **`SignOfLifeLog`**: minutes between periodic status log entries.
-- **`Deviceinstance`**: this device's Venus OS D-Bus instance number.
-- **`HardwareVersion`**: go-e hardware generation. Only affects the
+- **`AccessType`** *(restart)*: always `OnPremise`.
+- **`SignOfLifeLog`** *(restart)*: minutes between periodic status log entries.
+- **`Deviceinstance`** *(restart)*: this device's Venus OS D-Bus instance number.
+- **`HardwareVersion`** *(restart)*: go-e hardware generation. Only affects the
   temperature reading (`/MCU/Temperature`) - energy calculation (`eto`) is
   handled uniformly via the API v2 unit (Wh) in this fork, since
   `/api/status` always returns API v2 data.
-- **`AcPosition`**: `0` = AC Output (critical loads), `1` = AC Input.
-- **`Logging`**: `DEBUG`/`INFO`/`WARN`/etc. At `WARN`, one line is still
+- **`AcPosition`** *(restart)*: `0` = AC Output (critical loads), `1` = AC Input.
+- **`Logging`** *(restart)*: `DEBUG`/`INFO`/`WARN`/etc. At `WARN`, one line is still
   logged on successful startup regardless of this setting - see
   "Restrictions" above.
 
 ### Charge control master switch
 
-- **`EnableChargeControl`**: when `false` or omitted, this script behaves
+- **`EnableChargeControl`** *(restart)*: when `false` or omitted, this script behaves
   exactly like the original - monitoring only, `/Mode` not writable, no
   writes to `lmo`/`fup`/scheduler, no PV surplus push. Every option below
   this line has no effect in that case.
@@ -187,8 +187,8 @@ default and can be safely omitted.
 The EV only starts charging once the home battery has reached a configured
 SOC.
 
-- **`BatteryPriorityMinSoc`**: `0` or omit = feature disabled (default `0`).
-- **`BatteryPriorityHysteresis`**: in percentage points. Charging pauses
+- **`BatteryPriorityMinSoc`** *(live)*: `0` or omit = feature disabled (default `0`).
+- **`BatteryPriorityHysteresis`** *(live)*: in percentage points. Charging pauses
   below `BatteryPriorityMinSoc` and is only released again once SOC reaches
   `BatteryPriorityMinSoc + hysteresis` - prevents flapping right at the
   threshold. Default `2`.
@@ -198,14 +198,14 @@ SOC.
 Above a second, higher SOC, a configurable amount of home battery power is
 allowed to help charge the EV too (virtual surplus added to `pGrid`).
 
-- **`BatterySupportMinSoc`**: `0` or omit = feature disabled (default `0`).
-- **`BatterySupportPower`**: additional power in W reported to the go-e as
+- **`BatterySupportMinSoc`** *(live)*: `0` or omit = feature disabled (default `0`).
+- **`BatterySupportPower`** *(live)*: additional power in W reported to the go-e as
   virtual surplus. Should not exceed the system's actual discharge limit,
   otherwise the difference is drawn from the grid instead. Default `0`
   (meaning: no effect until you set both this and `BatterySupportMinSoc`).
-- **`BatterySupportHysteresis`**: in percentage points - the buffer stays
+- **`BatterySupportHysteresis`** *(live)*: in percentage points - the buffer stays
   active down to `BatterySupportMinSoc - hysteresis`. Default `2`.
-- **`BatterySupportCompensatePgt`**: `1` (not `true` - this is read as a
+- **`BatterySupportCompensatePgt`** *(live)*: `1` (not `true` - this is read as a
   number) compensates for `pgt`'s continuous reserve while the buffer is
   active, by adding `pgt`'s magnitude on top of `BatterySupportPower` -
   without this, `pgt` (configured in the go-e app, see below) reduces the
@@ -214,7 +214,7 @@ allowed to help charge the EV too (virtual surplus added to `pGrid`).
   current reduction has only been empirically observed, not confirmed as a
   precise formula - this is a reasonable approximation, not a guaranteed
   exact match. `0` or omit = disabled (default).
-- **`BatterySupportMinPv`**: minimum real PV production (`pPv`, in W)
+- **`BatterySupportMinPv`** *(live)*: minimum real PV production (`pPv`, in W)
   required alongside the SOC threshold before the virtual surplus boost is
   actually applied. Without this, the SOC threshold alone is sufficient to
   trigger the boost - a fully-charged battery sitting above the threshold at
@@ -227,7 +227,7 @@ allowed to help charge the EV too (virtual surplus added to `pGrid`).
   (default, SOC-only behaviour, matching the original implementation) - this
   reliably means "no gating at all" even if real `pPv` happens to read
   slightly negative.
-- **`BatteryForceStartSoc`**: a third, higher SOC threshold (evcc calls the
+- **`BatteryForceStartSoc`** *(live)*: a third, higher SOC threshold (evcc calls the
   equivalent setting on its Battery page "bufferStartSoc") - above this
   level, `BatterySupportMinPv`'s gate is bypassed entirely and the boost
   applies unconditionally, even with zero real PV. Tracked with its own
@@ -243,7 +243,7 @@ allowed to help charge the EV too (virtual surplus added to `pGrid`).
 
 ### Rolling-average reset after leaving Auto mode
 
-- **`PvAverageResetCycles`**: how many cycles of pushing `pGrid`/`pPv`/`pAkku`=0
+- **`PvAverageResetCycles`** *(live)*: how many cycles of pushing `pGrid`/`pPv`/`pAkku`=0
   to send after leaving Auto mode (see "Findings" below for the full
   background). `0` or omit = disabled (default) - the go-e's rolling
   averages then simply stay frozen at whatever they were until real values
@@ -263,31 +263,68 @@ reasoning. This script still reads the current value (only for
 
 ### `/AutoStart` button function
 
-- **`AutoStartMode`**: see the dedicated section above for the full
+- **`AutoStartMode`** *(restart)*: see the dedicated section above for the full
   enumeration and reasoning. Read once at startup only - **a config.ini edit
   here needs a service restart**, unlike every other option on this page.
+
+### Preventing home battery discharge during Manual charging
+
+- **`PreventBatteryDischarge`** *(live)*: `0` or omit = disabled (default).
+  When `1`, the battery's current SOC is temporarily written to
+  `/Settings/CGwacs/BatteryLife/MinimumSocLimit` while the car is actually
+  charging (go-e `car==2`) in Manual **or** Scheduled mode, restoring the
+  original value once charging stops or the option is disabled - the same
+  mechanism evcc uses for Victron systems. **Tied to actually charging, not
+  merely to the mode itself** - switching to Manual is also commonly used
+  just to disable Eco mode without charging at all (e.g. to use
+  `/AutoStart`'s phase-switching override), and the lock must not engage in
+  that case (found live - see "Findings" below). Applies in both Manual and
+  Scheduled, since Scheduled (the go-e's own Daily Trip) can draw on the
+  battery outside genuine PV surplus too; Auto is deliberately excluded, as
+  it already has its own PV-aware battery logic
+  (`BatterySupportMinSoc`/`BatteryForceStartSoc`). See "Findings" below for
+  more reasoning, why this mechanism was chosen over other candidates, and
+  **importantly, a real, repeatedly-reported failure mode from evcc's own
+  equivalent feature that applies here too** - read this before enabling.
+  Checked every cycle, so it correctly reacts either via the Venus OS
+  `/Mode` switch or an externally-detected go-e app mode change. A manual
+  change to `MinimumSocLimit` directly in the Venus OS GUI while the lock
+  is already active is detected and adopted as the new
+  value to restore to later, rather than being silently overwritten.
+- **`CheckEssMinSocAtStartup`** *(restart)*: `0` or omit = disabled (default). When `1`,
+  `ExpectedEssMinSoc` (below) is compared once at every service start
+  against the actual `/Settings/CGwacs/BatteryLife/MinimumSocLimit`; a mismatch is treated
+  as evidence the lock above was left stuck active after a crash/unclean
+  shutdown (see "Findings" below) and is corrected automatically. A
+  one-time startup check only, not a continuous watchdog - deliberately
+  kept simple rather than building more elaborate monitoring. Follows this
+  fork's normal enable/disable pattern, unlike `ExpectedEssMinSoc` itself,
+  which can't (`0` is a genuinely valid `MinimumSocLimit` on some systems).
+- **`ExpectedEssMinSoc`** *(restart)*: the value to compare against - only consulted
+  when `CheckEssMinSocAtStartup=1`. If the switch is on but this isn't set,
+  a warning is logged and the check is skipped rather than failing.
 
 ### `[ONPREMISE]`
 
 Both required (no code-level fallback).
 
-- **`Host`**: the go-e's IP address.
-- **`PauseBetweenRequests`**: poll interval in ms. Must stay at or below
+- **`Host`** *(restart)*: the go-e's IP address.
+- **`PauseBetweenRequests`** *(restart)*: poll interval in ms. Must stay at or below
   5000, since the go-e expects `pGrid`/`pPv`/`pAkku` to be updated at least
   every 5 seconds in Auto mode (see "Findings" below).
 
 ### What needs a restart, and what doesn't
 
-Only `AutoStartMode` needs a restart to take effect. Everything else in
-`[DEFAULT]` and `[ONPREMISE]` is either read once at genuine startup
-regardless (`AccessType`, `Deviceinstance`, `HardwareVersion`, `AcPosition`,
-`Logging`, `Host`, `PauseBetweenRequests`, `EnableChargeControl`) - these
-still need `restart.sh` after editing, since nothing re-reads them mid-run -
-or actively re-read every Auto-mode cycle without needing a restart
-(`BatteryPriorityMinSoc`, `BatteryPriorityHysteresis`, `BatterySupportMinSoc`,
-`BatterySupportPower`, `BatterySupportHysteresis`,
-`BatterySupportCompensatePgt`, `BatterySupportMinPv`, `BatteryForceStartSoc`,
-`PvAverageResetCycles`).
+Every option above is now individually marked *(live)* or *(restart)*. In
+short: `AutoStartMode`, `CheckEssMinSocAtStartup`, and `ExpectedEssMinSoc`
+need a restart because each defines the meaning of a control path or is
+only ever consulted once, at genuine startup. `AccessType`, `Deviceinstance`,
+`HardwareVersion`, `AcPosition`, `Logging`, `Host`, `PauseBetweenRequests`,
+and `EnableChargeControl` are also read once at startup - these still need
+`restart.sh` after editing, since nothing re-reads them mid-run. Everything
+else is actively re-read every Auto-mode cycle (or, for
+`PreventBatteryDischarge`, every cycle regardless of mode) without
+needing a restart at all.
 
 ## Findings
 
@@ -462,6 +499,13 @@ with `ESP_ERR_HTTPD_RESULT_TRUNC` - the go-e's ESP32 HTTP server has a
 limited request buffer. Fixed by encoding the JSON compactly, saving ~30
 characters per call.)
 
+**Not extensively live-tested** - unlike Auto and Manual, which were both
+tested extensively over many live sessions, Scheduled mode has no real use
+case for this fork's own installation and has therefore not been verified
+in real day-to-day use beyond confirming the basic mode switch itself
+works. If you rely on Scheduled/Daily Trip, please verify carefully and
+report back if anything doesn't behave as documented here.
+
 ### Fresh PV data is pushed *before* activating Eco mode, not after
 
 **Found live:** switching Auto (charging on genuine surplus) -> Manual ->
@@ -549,6 +593,123 @@ any system's ESS will physically balance a momentary production/demand gap
 from the battery regardless of what any external controller "intends" -
 this fork's settings control what *this script itself* signals to the go-e,
 not the underlying physical behaviour of the Multiplus/ESS system.
+
+### Preventing battery discharge during Manual charging: three mechanisms considered
+
+Requested to mirror an evcc option that keeps the home battery from being
+drawn on while manually charging the car. Three candidate mechanisms were
+investigated before picking one:
+
+- **VE.Bus "Switch" register (`/Mode` on `com.victronenergy.vebus.*`,
+  Modbus register 33; 1=Charger Only, 2=Inverter Only, 3=On, 4=Off).**
+  **Rejected as a general default:** multiple independent sources confirm
+  "Charger Only" mode disables AC-Out entirely, regardless of grid
+  presence - not "battery left alone, everything else runs as normal", but
+  a full loss of AC output for anything connected there. Only safe if
+  nothing is actually wired to AC-Out (confirmed to be the case for this
+  fork's own installation) - **not implemented, since this fork is used by
+  others whose wiring can't be assumed.**
+- **ESS-level `/Settings/CGwacs/MaxDischargePower` set to `0`.** Confirmed
+  via a real community project
+  ([t0bias-r/venusos_acload_prioritize](https://github.com/t0bias-r/venusos_acload_prioritize))
+  to stop discharge while still allowing PV to be used directly. Not
+  chosen: evcc's own maintainers, in their tracking issue for this exact
+  feature, flag this as unconfirmed whether it also disables Peak Shaving.
+- **DVCC `/Info/MaxDischargeCurrent` (the "DCL" a BMS normally publishes),
+  artificially set to `0`.** Confirmed behaviour: at DCL=0, the system
+  drops to grid passthrough (AC-Out stays powered) if the grid is present,
+  or turns the inverter off if it isn't - conceptually the cleanest
+  option, but requires either overriding an existing real BMS's own
+  published value (risky) or registering an entirely new virtual "battery"
+  D-Bus service just to report this one artificial limit. Not implemented,
+  given the added architectural complexity.
+
+**What was implemented instead, matching evcc's own actual mechanism for
+Victron systems:** temporarily raising `/Settings/CGwacs/BatteryLife/MinimumSocLimit` to
+the battery's current SOC while in Manual mode (confirmed via evcc's own
+GitHub issue tracker: "The current Victron integration manages the battery
+discharge during fast charging by setting minimum SOC = current SOC").
+Chosen for being simple, requiring no new D-Bus service, and - unlike
+Switch-Mode - not touching AC-Out at all while the grid is present.
+
+**Read this before enabling `PreventBatteryDischarge` - a real,
+repeatedly-reported failure mode from evcc's own implementation of this
+exact mechanism applies here too:** if the restore step fails (a transient
+D-Bus error, or this script crashing/being killed while the lock is
+active), the raised `MinimumSocLimit` can be left stuck in place until
+manually corrected. This is not a hypothetical risk - it is independently
+confirmed multiple times in evcc's own issue tracker, e.g.
+[evcc-io/evcc#16326](https://github.com/evcc-io/evcc/issues/16326) ("the
+battery is essentially crippled... it will not discharge any further until
+I change the MinSoc manually" - triggered there by a plain Modbus i/o
+timeout during the restore step) and a German-language report of the exact
+same pattern
+([evcc-io/evcc#23557](https://github.com/evcc-io/evcc/discussions/23557)).
+A third, related evcc/Victron report describes the inverter getting stuck
+in a "Maintenance" state after the lock was lifted, recoverable only by
+power-cycling the Multiplus
+([evcc-io/evcc#27837](https://github.com/evcc-io/evcc/issues/27837)).
+
+**Deliberately not addressed by a full watchdog/timeout mechanism** - this
+was considered but rejected as disproportionate, given evcc itself doesn't
+solve this either. Two lighter-weight improvements were added instead,
+without going as far as continuous monitoring:
+
+- **External changes to `MinimumSocLimit` while the lock is active are
+  detected and respected**, rather than silently being overwritten by the
+  stale value recorded when the lock was first applied - if you (or
+  something else) manually change it mid-session, that new value becomes
+  what gets restored later, and the lock is re-applied on top of it using
+  the current SOC.
+- **`CheckEssMinSocAtStartup` + `ExpectedEssMinSoc`**: an optional,
+  one-time check at every service start - if the actual `MinimumSocLimit`
+  doesn't match what you've configured as your normal value, this is
+  treated as evidence of exactly the stuck-lock scenario described above
+  (e.g. after a crash) and is corrected automatically. This is not a
+  continuous watchdog - it only runs once, at startup - but directly
+  catches the most common trigger for this failure mode (the service being
+  killed/crashing and then simply being restarted, which happens
+  automatically under daemontools).
+
+If enabling `PreventBatteryDischarge`, checking
+`/Settings/CGwacs/BatteryLife/MinimumSocLimit` after any unclean restart or crash while a
+Manual charging session was active is still worth doing manually too - the
+above catches the most common cases, not every conceivable one (e.g. this
+script itself functioning normally throughout, but the lock never being
+left in the first place due to some other, unrelated logic error).
+
+**Found live: tying the lock to the mode alone (Manual) rather than to
+actually charging was wrong.** Switching to Manual mode is also commonly
+used simply to disable Eco mode without charging at all - e.g. to use the
+`/AutoStart` phase-switching override, or just to stop the go-e's own
+surplus evaluation temporarily - and the lock must not engage purely
+because of that mode switch. **Fixed**: the lock now additionally requires
+`car==2` (go-e reports "actively charging"), checked alongside the mode, so
+it only engages while a car is genuinely drawing current. **Also extended
+to Scheduled mode** (not just Manual) at the same time, since the go-e's
+own Daily Trip charging (Scheduled) is just as able to draw on the battery
+outside of genuine PV surplus as Manual charging is - Auto remains
+deliberately excluded, since it already has its own PV-aware battery logic
+via `BatterySupportMinSoc`/`BatteryForceStartSoc`.
+
+**Found live: the initially-used path, `/Settings/Ess/MinimumSocLimit`, was
+wrong for this fork's own installation (and for classic VE.Bus systems in
+general).** That path only exists under `com.victronenergy.acsystem` -
+the newer Multi RS / "acsystem" product line, per the official
+[victronenergy/venus dbus wiki](https://github.com/victronenergy/venus/wiki/dbus)
+(confirmed live: querying `com.victronenergy.acsystem` on a classic
+Multiplus-II GX system raises `ServiceUnknown` - that service simply
+doesn't exist there). The correct path for classic VE.Bus systems (Multi,
+Quattro, MultiPlus-II) is `/Settings/CGwacs/BatteryLife/MinimumSocLimit`
+under `com.victronenergy.settings`, confirmed live by reading back the
+exact SOC value that had been set manually beforehand.
+
+**Confirmed live: `MinimumSocLimit` stores fractional values exactly, no
+rounding to whole percent.** Writing `62.7` directly and reading it back
+returned exactly `62.7`, not rounded to `62`/`63`. This confirms this
+fork's approach - writing whatever `/Dc/Battery/Soc` reports, which is
+itself already limited to one decimal place by Venus OS - is safe as-is,
+with no additional rounding needed before writing it.
 
 ### Phase-switch anti-flapping lock (`mptwt`) can cause a stop/start loop
 

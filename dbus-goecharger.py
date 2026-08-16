@@ -191,6 +191,50 @@ class DbusGoeChargerService:
       self._batteryPowerItem = None
       self._batterySocItem = None
 
+    # Separate connection to com.victronenergy.settings (a different service
+    # than com.victronenergy.system above) for the optional battery-discharge
+    # lock during Manual charging - see PreventBatteryDischarge in
+    # README ("Configuration reference") for the full reasoning, evcc
+    # comparison, and known failure modes.
+    try:
+      self._essMinSocItem = VeDbusItemImport(systemBus, 'com.victronenergy.settings', '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
+    except Exception as e:
+      logging.warning("Could not connect to /Settings/CGwacs/BatteryLife/MinimumSocLimit - PreventBatteryDischarge will be unavailable: %s" % e)
+      self._essMinSocItem = None
+    # None = lock not currently active; otherwise the MinimumSocLimit value
+    # to restore once Manual mode is left (or the feature is disabled).
+    self._savedEssMinSoc = None
+    self._lastCommandedEssMinSoc = None
+
+    # One-time startup sanity check for PreventBatteryDischarge - see
+    # README ("Preventing battery discharge...") for the full reasoning.
+    # CheckEssMinSocAtStartup follows this fork's normal "0 = disabled"
+    # pattern; ExpectedEssMinSoc is only consulted once that switch is on,
+    # since 0 is a genuinely valid MinimumSocLimit on some systems and
+    # couldn't itself serve as an enable/disable value here.
+    if self._getSetting('CheckEssMinSocAtStartup', 0) and self._essMinSocItem is not None:
+      expectedEssMinSoc = config['DEFAULT'].get('ExpectedEssMinSoc', None)
+      if expectedEssMinSoc is None:
+        logging.warning("CheckEssMinSocAtStartup=1 but ExpectedEssMinSoc is not set - skipping startup sanity check")
+      else:
+        try:
+          expectedEssMinSoc = float(expectedEssMinSoc)
+          currentEssMinSoc = self._safeGetValue(self._essMinSocItem, '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
+          if currentEssMinSoc is None:
+            logging.warning("CheckEssMinSocAtStartup=1 but /Settings/CGwacs/BatteryLife/MinimumSocLimit could not be read - "
+                            "skipping startup sanity check this time")
+          elif abs(currentEssMinSoc - expectedEssMinSoc) > 0.01:
+            logging.warning("ExpectedEssMinSoc=%s%% but /Settings/CGwacs/BatteryLife/MinimumSocLimit is currently %s%% - this "
+                            "looks like PreventBatteryDischarge was left stuck active after an unclean "
+                            "shutdown or crash (see README). Restoring it to %s%% now." %
+                            (expectedEssMinSoc, currentEssMinSoc, expectedEssMinSoc))
+            try:
+              self._essMinSocItem.set_value(expectedEssMinSoc)
+            except Exception as e:
+              logging.warning("Could not restore MinimumSocLimit to the expected value at startup: %s" % e)
+        except (TypeError, ValueError) as e:
+          logging.warning("config.ini: ExpectedEssMinSoc is not a valid number - skipping startup sanity check: %s" % e)
+
     # add _update function 'timer'
     gobject.timeout_add(pauseBetweenRequests, self._update)
 
@@ -494,6 +538,115 @@ class DbusGoeChargerService:
     except Exception as e:
       logging.critical('Error at %s', '_applyChargeMode', exc_info=e)
 
+  def _updateBatteryDischargeLock(self, carState):
+    '''
+    Optional feature (PreventBatteryDischarge): prevents the home
+    battery from discharging while the car is actually charging outside of
+    Auto mode (Manual or Scheduled), similar to evcc's equivalent option.
+    Implemented the same way evcc does it for Victron systems: temporarily
+    raises /Settings/CGwacs/BatteryLife/MinimumSocLimit to the battery's
+    current SOC while charging, restoring the original value once charging
+    stops (or the feature is disabled).
+
+    IMPORTANT (found live): tied to carState==2 (go-e reports "actively
+    charging"), NOT merely to being in Manual/Scheduled mode - switching to
+    Manual is also used simply to disable Eco mode, without necessarily
+    charging at all (e.g. to override /AutoStart's phase-switching without
+    also triggering the discharge lock) - the lock must not engage in that
+    case. Applies in BOTH Manual (0) and Scheduled (2) mode, since Scheduled
+    charging (the go-e's own Daily Trip) is just as capable of drawing on
+    the battery outside of genuine PV surplus as Manual charging is. Auto
+    mode (1) is deliberately excluded - that mode already has its own,
+    separate PV-aware battery logic (BatterySupportMinSoc/BatteryForceStartSoc).
+
+    Called every cycle regardless of HOW self._chargeMode most recently
+    changed - both an explicit Venus OS /Mode switch (via _applyChargeMode)
+    and an externally-detected go-e app mode change (in _update()) update
+    self._chargeMode, and this method reacts to the resulting value either
+    way, rather than being tied to one specific trigger path.
+
+    IMPORTANT LIMITATION, deliberately accepted rather than building a more
+    complex safeguard: if the restore write below fails (e.g. a transient
+    dbus error) or this service crashes/is killed while the lock is active,
+    the raised MinimumSocLimit can be left stuck in place, requiring manual
+    correction - this is a REAL, repeatedly reported failure mode in evcc's
+    own equivalent feature (see README Findings) and applies here too. No
+    watchdog/timeout is implemented for this - see README for the reasoning
+    and the explicit warning to check for this after any crash/unclean
+    restart while this feature is enabled.
+
+    Chosen deliberately over other candidate mechanisms (see README
+    Findings): raising MinimumSocLimit, unlike forcing the VE.Bus switch to
+    "Charger Only", does not disable AC-Out - loads/backup power remain
+    available for as long as the grid is present, and ESS's own normal
+    inverter/backup behaviour during an actual grid failure is unaffected.
+
+    A manual change to MinimumSocLimit WHILE the lock is already active
+    (e.g. directly in the Venus OS GUI) is detected and adopted as the new
+    value to restore to later, rather than being silently overwritten by
+    the stale value recorded when the lock was first applied.
+    '''
+    if self._essMinSocItem is None:
+      return
+    try:
+      preventDischarge = self._getSetting('PreventBatteryDischarge', 0)
+      lockShouldBeActive = bool(preventDischarge) and self._chargeMode in (0, 2) and carState == 2
+
+      if lockShouldBeActive and self._savedEssMinSoc is None:
+        currentSoc = self._safeGetValue(self._batterySocItem, '/Dc/Battery/Soc')
+        currentMinSoc = self._safeGetValue(self._essMinSocItem, '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
+        if currentSoc is None or currentMinSoc is None:
+          logging.warning("PreventBatteryDischarge: battery SOC or current MinimumSocLimit "
+                          "not available - battery discharge lock skipped this cycle")
+          return
+        self._savedEssMinSoc = currentMinSoc
+        try:
+          self._essMinSocItem.set_value(currentSoc)
+          self._lastCommandedEssMinSoc = currentSoc
+          logging.info("PreventBatteryDischarge: entered Manual mode - raised ESS MinimumSocLimit "
+                       "from %s%% to current SOC %s%% (will restore %s%% on leaving Manual)" %
+                       (self._savedEssMinSoc, currentSoc, self._savedEssMinSoc))
+        except Exception as e:
+          logging.warning("PreventBatteryDischarge: could not raise MinimumSocLimit - will retry next cycle: %s" % e)
+          self._savedEssMinSoc = None
+
+      elif not lockShouldBeActive and self._savedEssMinSoc is not None:
+        try:
+          self._essMinSocItem.set_value(self._savedEssMinSoc)
+          logging.info("PreventBatteryDischarge: restored ESS MinimumSocLimit to %s%%" % self._savedEssMinSoc)
+          self._savedEssMinSoc = None
+          self._lastCommandedEssMinSoc = None
+        except Exception as e:
+          logging.warning("PreventBatteryDischarge: could not restore MinimumSocLimit (still trying to "
+                          "restore %s%%) - will retry next cycle: %s" % (self._savedEssMinSoc, e))
+
+      elif lockShouldBeActive and self._savedEssMinSoc is not None:
+        # Lock already active, ongoing - check whether MinimumSocLimit was
+        # changed EXTERNALLY (e.g. directly in the Venus OS GUI) since we
+        # last set it. If so, the user's new value is adopted as the new
+        # value to restore to later (rather than silently overwriting their
+        # change with our old, stale record once Manual is eventually
+        # left) - matching the same "respect an external change" principle
+        # used elsewhere in this fork (lmo, psm). The lock itself is then
+        # re-applied on top of this new baseline, using the current SOC
+        # again, since Manual charging is still ongoing.
+        currentMinSoc = self._safeGetValue(self._essMinSocItem, '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
+        if (currentMinSoc is not None and self._lastCommandedEssMinSoc is not None and
+            abs(currentMinSoc - self._lastCommandedEssMinSoc) > 0.01):
+          logging.info("PreventBatteryDischarge: MinimumSocLimit changed externally while the lock was "
+                       "active (now %s%%, we had set %s%%) - adopting %s%% as the new value to restore later" %
+                       (currentMinSoc, self._lastCommandedEssMinSoc, currentMinSoc))
+          self._savedEssMinSoc = currentMinSoc
+          currentSoc = self._safeGetValue(self._batterySocItem, '/Dc/Battery/Soc')
+          if currentSoc is not None:
+            try:
+              self._essMinSocItem.set_value(currentSoc)
+              self._lastCommandedEssMinSoc = currentSoc
+            except Exception as e:
+              logging.warning("PreventBatteryDischarge: could not re-apply lock after external "
+                              "MinimumSocLimit change: %s" % e)
+    except Exception as e:
+      logging.critical('Error at %s', '_updateBatteryDischargeLock', exc_info=e)
 
   def _pushPvSurplusValues(self):
     '''
@@ -802,6 +955,12 @@ class DbusGoeChargerService:
               except Exception as e:
                 logging.warning("Could not send PV reset push after leaving Auto mode: %s" % e)
                 self._pvResetCyclesRemaining -= 1
+
+            # Checked every cycle, regardless of whether self._chargeMode was
+            # just updated by the explicit Venus /Mode switch above or by the
+            # external lmo-change detection just above - see the method's
+            # own docstring for the full reasoning.
+            self._updateBatteryDischargeLock(carForTiming)
           else:
             currentLmo = None
 

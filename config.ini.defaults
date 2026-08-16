@@ -8,46 +8,33 @@
 ; Full explanations for every option: "Configuration reference" in
 ; README.md on GitHub:
 ; https://github.com/Gesiima/dbus-goecharger#configuration-reference
+;
+; AccessType, SignOfLifeLog, Deviceinstance, HardwareVersion, AcPosition,
+; Host, PauseBetweenRequests: required, no code-level fallback - values
+; below are placeholders, not real defaults.
 
 [DEFAULT]
-
-; --- Required: no code-level fallback exists for any of these. The service
-; will crash on startup if one is missing. Values below are placeholders -
-; replace with values matching your own installation. ---
 AccessType = OnPremise
 SignOfLifeLog = 1
 Deviceinstance = 43
 HardwareVersion = 4
 AcPosition = 1
-
-; --- Has a code-level default, safe to omit ---
 Logging = INFO
-
-; --- Master switch. Default: false (monitoring only, matches the original
-; script's behaviour) ---
 EnableChargeControl = false
-
-; --- Battery priority: all default to 0/disabled ---
 BatteryPriorityMinSoc = 0
 BatteryPriorityHysteresis = 2
-
-; --- Battery as a charging buffer: all default to 0/disabled ---
 BatterySupportMinSoc = 0
 BatterySupportPower = 0
 BatterySupportHysteresis = 2
 BatterySupportCompensatePgt = 0
 BatterySupportMinPv = 0
 BatteryForceStartSoc = 0
-
-; --- Rolling-average reset after leaving Auto mode. Default: 0 (disabled) ---
 PvAverageResetCycles = 0
-
-; --- /AutoStart button function. Default: 0 (disabled - button has no
-; function at all). Read once at startup only - needs a restart to change. ---
 AutoStartMode = 0
+PreventBatteryDischarge = 0
+CheckEssMinSocAtStartup = 0
+ExpectedEssMinSoc = 20
 
 [ONPREMISE]
-
-; --- Required: no code-level fallback exists for either of these. ---
 Host = 192.168.2.36
 PauseBetweenRequests = 5000

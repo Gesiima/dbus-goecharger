@@ -25,6 +25,9 @@ BatterySupportMinPv = 200
 BatteryForceStartSoc = 0
 PvAverageResetCycles = 1
 AutoStartMode = 3
+PreventBatteryDischarge = 1
+CheckEssMinSocAtStartup = 1
+ExpectedEssMinSoc = 20
 
 [ONPREMISE]
 Host = 192.168.2.36

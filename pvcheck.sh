@@ -35,9 +35,11 @@ Usage:
 
 Shows: charging status, reason (modelStatus), phase-switch mode (psm),
 live charging power/current, pGrid/pPv/pAkku, the go-e's internal rolling
-averages of those three, and the home battery SOC alongside the
-configured BatteryPriorityMinSoc/BatterySupportMinSoc thresholds - all
-decoded to readable labels.
+averages of those three, the home battery SOC alongside the configured
+BatteryPriorityMinSoc/BatterySupportMinSoc thresholds, and (if
+PreventBatteryDischargeInManual is enabled) the current ESS
+MinimumSocLimit alongside a best-effort guess at whether the discharge
+lock is likely active - all decoded to readable labels.
 
 Host is read from config.ini (section [ONPREMISE], key Host) if the file
 is present in the same directory as this script, otherwise falls back to
@@ -76,7 +78,7 @@ HOST=${HOST:-192.168.2.36}
 # restart needed), so reading them once at startup here would show stale
 # thresholds that no longer match what the service is actually applying.
 
-FILTER="car,modelStatus,psm,err,pgrid,ppv,pakku,pvopt_averagePGrid,pvopt_averagePPv,pvopt_averagePAkku,nrg"
+FILTER="car,modelStatus,psm,err,pgrid,ppv,pakku,pvopt_averagePGrid,pvopt_averagePPv,pvopt_averagePAkku,nrg,lmo"
 
 # The Python formatting logic is written to its own file instead of being
 # embedded inline via "python3 -c '...'" - this avoids quoting conflicts
@@ -109,6 +111,7 @@ MODELSTATUS = {
     25: "ChargeDelay", 26: "Error", 27: "LoadManagementDoesntWant",
 }
 PSM = {0: "Auto", 1: "forced 1-phase", 2: "forced 3-phase"}
+MODE = {4: "Auto", 5: "Scheduled"}  # anything else -> Manual
 
 
 def fmt_w(v):
@@ -137,11 +140,15 @@ def main():
     #   argv[1] = actual battery SOC (from dbus), or empty if unavailable
     #   argv[2] = BatteryPriorityMinSoc, argv[3] = its hysteresis
     #   argv[4] = BatterySupportMinSoc,  argv[5] = its hysteresis
+    #   argv[6] = PreventBatteryDischargeInManual (0/1)
+    #   argv[7] = current /Settings/CGwacs/BatteryLife/MinimumSocLimit (from dbus), or empty
     soc = fmt_soc(sys.argv[1]) if len(sys.argv) > 1 else None
     prioMinSoc = float(sys.argv[2]) if len(sys.argv) > 2 else 0
     prioHyst = float(sys.argv[3]) if len(sys.argv) > 3 else 0
     supportMinSoc = float(sys.argv[4]) if len(sys.argv) > 4 else 0
     supportHyst = float(sys.argv[5]) if len(sys.argv) > 5 else 0
+    dischargeLockEnabled = sys.argv[6] == "1" if len(sys.argv) > 6 else False
+    essMinSoc = fmt_soc(sys.argv[7]) if len(sys.argv) > 7 else None
 
     try:
         d = json.load(sys.stdin)
@@ -150,6 +157,7 @@ def main():
         return
 
     car = d.get("car")
+    lmo = d.get("lmo")
     ms = d.get("modelStatus")
     psm = d.get("psm")
     pgrid = d.get("pgrid")
@@ -200,6 +208,26 @@ def main():
     else:
         print("          Battery: SOC not available (dbus query failed or not run on Venus OS)")
 
+    # ESS MinimumSocLimit is always shown (useful diagnostic on its own,
+    # e.g. to see your normal baseline), with the "likely active/inactive"
+    # guess only added if PreventBatteryDischargeInManual is enabled.
+    # NOTE: same caveat as above - this can't be a guaranteed live match to
+    # the running script's actual internal state (_savedEssMinSoc, not
+    # exposed on dbus) - e.g. right after the car stops charging, the real
+    # script may take one more cycle to restore the value than this
+    # snapshot suggests.
+    essTxt = "{:.1f}%".format(essMinSoc) if essMinSoc is not None else "n/a"
+    if dischargeLockEnabled:
+        modeTxt = MODE.get(lmo, "Manual")
+        if car == 2 and modeTxt in ("Manual", "Scheduled"):
+            print("          ESS MinimumSocLimit: {} | PreventBatteryDischargeInManual=1 -> "
+                  "likely ACTIVE (charging in {})".format(essTxt, modeTxt))
+        else:
+            print("          ESS MinimumSocLimit: {} | PreventBatteryDischargeInManual=1 -> "
+                  "likely inactive (not charging in Manual/Scheduled)".format(essTxt))
+    else:
+        print("          ESS MinimumSocLimit: {} (PreventBatteryDischargeInManual disabled)".format(essTxt))
+
     print("-" * 70)
 
 
@@ -215,19 +243,21 @@ fetch_and_print() {
   fi
   # Battery SOC read directly from Venus OS, if the 'dbus' CLI tool is
   # available (it is on Venus OS itself, not necessarily elsewhere).
-  local soc=""
+  local soc="" essMinSoc=""
   if command -v dbus >/dev/null 2>&1; then
     soc=$(dbus -y com.victronenergy.system /Dc/Battery/Soc GetValue 2>/dev/null)
+    essMinSoc=$(dbus -y com.victronenergy.settings /Settings/CGwacs/BatteryLife/MinimumSocLimit GetValue 2>/dev/null)
   fi
   # Thresholds are read fresh on every refresh (not once at startup), so that
   # editing config.ini while -w is running shows up in the next output line -
   # matching the main script, which also applies these live without a restart.
-  local prioMinSoc prioHyst supportMinSoc supportHyst
+  local prioMinSoc prioHyst supportMinSoc supportHyst dischargeLockEnabled
   prioMinSoc=$(get_ini_value "BatteryPriorityMinSoc" "0")
   prioHyst=$(get_ini_value "BatteryPriorityHysteresis" "2")
   supportMinSoc=$(get_ini_value "BatterySupportMinSoc" "0")
   supportHyst=$(get_ini_value "BatterySupportHysteresis" "2")
-  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst"
+  dischargeLockEnabled=$(get_ini_value "PreventBatteryDischargeInManual" "0")
+  echo "$json" | python3 "$PYHELPER" "$soc" "$prioMinSoc" "$prioHyst" "$supportMinSoc" "$supportHyst" "$dischargeLockEnabled" "$essMinSoc"
 }
 
 if [ "$1" == "-w" ]; then
