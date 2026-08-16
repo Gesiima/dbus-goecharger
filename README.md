@@ -354,9 +354,18 @@ needing a restart at all.
 ## Findings
 
 Everything below was found through live testing against one specific device
-(go-e V4, firmware 60.6) and isn't officially documented by go-e - some of it
-may differ on other firmware/hardware versions. Grouped by subsystem, in
-roughly the order these were discovered.
+(go-e V4) and isn't officially documented by go-e - some of it may differ on
+other firmware/hardware versions. Grouped by subsystem, in roughly the
+order these were discovered.
+
+**Firmware note:** all findings below were established against firmware
+`60.6`. This installation has since switched to `59.4` (the current
+**stable** release - `60.6` was itself a go-e beta, deliberately moved away
+from in favor of stable; only Venus OS currently still runs a beta, kept
+for now specifically because of a Shelly integration limitation unrelated
+to this fork). No functional issues are expected on `59.4`, but this has
+not yet been independently re-verified against the findings below - treat
+anything here as provisional until confirmed on `59.4` specifically.
 
 ### `amp` is a CEILING, not the live-regulated current
 
