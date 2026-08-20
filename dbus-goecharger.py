@@ -57,6 +57,19 @@ class DbusGoeChargerService:
     # (disabled). Also runs once after a restart, cancelled immediately if
     # the go-e turns out to already be in Auto (see _update()'s lmo check).
     self._pvResetCyclesRemaining = self._getSetting('PvAverageResetCycles', 0)
+    # GridCurrentLimit safety feature - protects the house connection fuse
+    # (SLS) against overload from the EV charger plus other simultaneous
+    # loads, independent of charge mode. See README Findings
+    # ("GridCurrentLimit..."). State machine: 'normal' -> 'reduced' (amp
+    # forced down to GridCurrentMinAmp) -> 'paused' (frc forced to 1, only
+    # reached if even the minimum amp isn't enough headroom). Disabled by
+    # default (GridCurrentLimit=0).
+    self._gridOverloadState = 'normal'
+    self._gridOverloadSustainedCount = 0
+    self._gridOverloadReleaseCount = 0
+    self._gridOverloadMissingReadingCount = 0
+    self._gridOverloadSavedAmp = None
+    self._gridOverloadSavedFrc = None
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
@@ -190,6 +203,24 @@ class DbusGoeChargerService:
       self._pvPowerDcItem = None
       self._batteryPowerItem = None
       self._batterySocItem = None
+
+    # Separate, isolated try/except for the GridCurrentLimit safety feature
+    # (see below) - deliberately NOT combined with the block above, so that
+    # if these specific paths are unavailable on a given system, the
+    # already-working PV/grid/battery items above are not also taken down.
+    # Actual CURRENT (A), not power - per-phase, since one phase can be
+    # near its rated limit while aggregate power still looks unremarkable
+    # (confirmed as a known real-world go-e community concern - see README
+    # Findings, "GridCurrentLimit...").
+    try:
+      self._gridCurrentItemL1 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L1/Current')
+      self._gridCurrentItemL2 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L2/Current')
+      self._gridCurrentItemL3 = VeDbusItemImport(systemBus, 'com.victronenergy.system', '/Ac/Grid/L3/Current')
+    except Exception as e:
+      logging.warning("Could not connect to per-phase grid current items - GridCurrentLimit will be unavailable: %s" % e)
+      self._gridCurrentItemL1 = None
+      self._gridCurrentItemL2 = None
+      self._gridCurrentItemL3 = None
 
     # Separate connection to com.victronenergy.settings (a different service
     # than com.victronenergy.system above) for the optional battery-discharge
@@ -672,6 +703,208 @@ class DbusGoeChargerService:
     except Exception as e:
       logging.critical('Error at %s', '_updateBatteryDischargeLock', exc_info=e)
 
+  def _checkGridCurrentLimit(self, data):
+    '''
+    Optional feature (GridCurrentLimit): protects the house connection fuse
+    (SLS) against overload from the EV charger plus other simultaneous
+    loads, independent of charge mode - unlike go-e's own built-in "static"
+    load balancing (which only coordinates between go-e chargers and does
+    NOT react to other house loads like ovens or heat pumps), or "dynamic"
+    load balancing (which requires the separate go-e Controller hardware
+    accessory with its own current-transformer measurement). This fork
+    achieves an equivalent result using the current measurement Venus OS
+    already has from its own grid meter, with no extra hardware.
+
+    Monitors actual per-phase CURRENT (A), not power - deliberately, since
+    with typically single-phase charging, one phase can be near its rated
+    limit while aggregate power still looks unremarkable (a concern
+    explicitly raised in real go-e community discussions about exactly
+    this scenario). GridCurrentLimit is per-phase (e.g. a "35A SLS" means
+    35A on EACH phase, not a 35A total).
+
+    State machine, escalating one step at a time, each step requiring
+    GridCurrentSustainedCycles consecutive over-threshold cycles:
+      normal -> reduced (amp forced down to GridCurrentMinAmp)
+      reduced -> paused (frc forced to 1) - only reached if the phase
+        current is STILL over threshold even at the reduced amp, i.e.
+        other house loads alone already exceed the safety margin
+    If amp is already at or below GridCurrentMinAmp at the moment normal
+    charging is found to be over threshold, escalates directly to paused -
+    forcing amp down further would not have helped.
+
+    Recovery is symmetric and fully automatic: GridCurrentReleaseCycles
+    consecutive UNDER-threshold cycles restore the exact amp/frc values
+    that were in effect immediately before this fork's own intervention
+    (read live from the go-e at the moment of first intervening, not
+    inferred from mode logic) - this correctly hands control back to
+    whatever amp the user had set in Manual, or lets Auto's own per-cycle
+    ceiling logic naturally reassert itself right after.
+
+    Disabled entirely by default (GridCurrentLimit=0 or unset). Applies in
+    ALL charge modes as a safety overlay on top of whatever that mode's own
+    logic is doing - this is the one feature in this fork that writes
+    amp/frc in Manual mode.
+
+    GridCurrentLimitMode controls how this feature behaves once triggered:
+    0=off (default, skipped entirely), 1=log only (the full state machine
+    below runs exactly as normal, including all WARNING-level log lines,
+    but the actual amp/frc write calls are skipped - lets you observe what
+    this feature WOULD do, with your real house's load patterns, before
+    trusting it to actually intervene), 2=active (writes amp/frc for real).
+    Every log line below is identical in wording between log-only and
+    active mode except for an explicit "[LOG ONLY, not applied]" prefix
+    this fork adds - so grepping the log tells you unambiguously which
+    mode produced it.
+    '''
+    if self._gridCurrentItemL1 is None and self._gridCurrentItemL2 is None and self._gridCurrentItemL3 is None:
+      return
+    try:
+      limitMode = self._getSetting('GridCurrentLimitMode', 0)
+      if limitMode not in (1, 2):
+        if self._gridOverloadState != 'normal':
+          # Feature was live-disabled (or switched to an invalid value)
+          # mid-override via config.ini - release immediately rather than
+          # leaving amp/frc stuck.
+          logging.info("GridCurrentLimit disabled while an override was active - releasing immediately")
+          self._releaseGridOverload(logOnly=False)
+        return
+      logOnly = (limitMode == 1)
+      logPrefix = "[LOG ONLY, not applied] " if logOnly else ""
+
+      gridLimit = self._getSetting('GridCurrentLimit', 0)
+      if gridLimit <= 0:
+        if self._gridOverloadState != 'normal':
+          logging.info("GridCurrentLimit disabled while an override was active - releasing immediately")
+          self._releaseGridOverload(logOnly=False)
+        return
+
+      margin = self._getSetting('GridCurrentSafetyMargin', 3)
+      # Deliberately separate from the trigger margin - safety-first
+      # principle explicitly requested: releasing back to full current
+      # should be MORE conservative than triggering the reduction was, to
+      # avoid flapping back and forth if the load happens to hover right
+      # around a single shared threshold. Defaults to requiring an extra
+      # 2A of headroom (on top of GridCurrentSafetyMargin) before release.
+      releaseMargin = self._getSetting('GridCurrentReleaseMargin', 2)
+      minAmp = self._getSetting('GridCurrentMinAmp', 6)
+      sustainedCycles = max(1, self._getSetting('GridCurrentSustainedCycles', 3))
+      releaseCycles = max(1, self._getSetting('GridCurrentReleaseCycles', 3))
+      # Same safety-first principle: if the grid current can't be verified
+      # at all for several consecutive cycles (sensor/communication
+      # problem), that is treated as a reason to pause rather than to
+      # silently do nothing - a missing reading must never mean "assume
+      # it's fine". Reuses the same GridCurrentSustainedCycles count.
+      missingReadingCycles = max(1, self._getSetting('GridCurrentSustainedCycles', 3))
+      triggerThreshold = gridLimit - margin
+      releaseThreshold = gridLimit - margin - releaseMargin
+
+      l1 = self._safeGetValue(self._gridCurrentItemL1, '/Ac/Grid/L1/Current')
+      l2 = self._safeGetValue(self._gridCurrentItemL2, '/Ac/Grid/L2/Current')
+      l3 = self._safeGetValue(self._gridCurrentItemL3, '/Ac/Grid/L3/Current')
+      readings = [abs(v) for v in (l1, l2, l3) if v is not None]
+      if not readings:
+        self._gridOverloadMissingReadingCount += 1
+        logging.warning("GridCurrentLimit enabled but no per-phase grid current reading is "
+                        "available this cycle (%d consecutive cycle(s)) - cannot verify safety" %
+                        self._gridOverloadMissingReadingCount)
+        if (self._gridOverloadMissingReadingCount >= missingReadingCycles and
+            self._gridOverloadState != 'paused'):
+          logOnly = self._getSetting('GridCurrentLimitMode', 0) == 1
+          logPrefix = "[LOG ONLY, not applied] " if logOnly else ""
+          if self._gridOverloadState == 'normal':
+            self._gridOverloadSavedAmp = int(data['amp']) if 'amp' in data and data['amp'] is not None else None
+          self._gridOverloadSavedFrc = self._lastCommandedFrc
+          if not logOnly:
+            self._setFrc(1)
+          self._gridOverloadState = 'paused'
+          logging.warning("%sGridCurrentLimit: grid current unavailable for %d consecutive cycles - "
+                          "pausing charging as a fail-safe (cannot verify the house connection is "
+                          "within its rated limit)" % (logPrefix, self._gridOverloadMissingReadingCount))
+        return
+      self._gridOverloadMissingReadingCount = 0
+      maxPhaseCurrent = max(readings)
+
+      if maxPhaseCurrent > triggerThreshold:
+        self._gridOverloadReleaseCount = 0
+        self._gridOverloadSustainedCount += 1
+        if self._gridOverloadSustainedCount >= sustainedCycles:
+          self._gridOverloadSustainedCount = 0
+          liveAmp = int(data['amp']) if 'amp' in data and data['amp'] is not None else None
+          if self._gridOverloadState == 'normal':
+            if liveAmp is not None and liveAmp <= minAmp:
+              # Already at/below the configured minimum - reducing further
+              # would not help, so escalate straight to pausing.
+              self._gridOverloadSavedFrc = self._lastCommandedFrc
+              if not logOnly:
+                self._setFrc(1)
+              self._gridOverloadState = 'paused'
+              logging.warning("%sGridCurrentLimit: phase current %.1fA exceeds %.1fA (limit %.1fA - margin "
+                              "%.1fA) and amp is already at/below the configured minimum (%dA) - "
+                              "pausing charging" % (logPrefix, maxPhaseCurrent, triggerThreshold, gridLimit, margin, minAmp))
+            else:
+              self._gridOverloadSavedAmp = liveAmp
+              if not logOnly:
+                ok = self._setGoeChargerValueV2('amp', minAmp)
+                if ok:
+                  self._lastCommandedAmp = minAmp
+              logging.warning("%sGridCurrentLimit: phase current %.1fA exceeds %.1fA (limit %.1fA - margin "
+                              "%.1fA) for %d consecutive cycles - reducing amp from %s to %dA" %
+                              (logPrefix, maxPhaseCurrent, triggerThreshold, gridLimit, margin, sustainedCycles, liveAmp, minAmp))
+              self._gridOverloadState = 'reduced'
+          elif self._gridOverloadState == 'reduced':
+            # Still over threshold even at the reduced minimum - other
+            # house loads alone already exceed the safety margin.
+            self._gridOverloadSavedFrc = self._lastCommandedFrc
+            if not logOnly:
+              self._setFrc(1)
+            self._gridOverloadState = 'paused'
+            logging.warning("%sGridCurrentLimit: phase current %.1fA still exceeds %.1fA even at the "
+                            "reduced amp - pausing charging entirely" % (logPrefix, maxPhaseCurrent, triggerThreshold))
+          # else already 'paused' - nothing further to escalate to.
+      elif maxPhaseCurrent <= releaseThreshold:
+        self._gridOverloadSustainedCount = 0
+        if self._gridOverloadState != 'normal':
+          self._gridOverloadReleaseCount += 1
+          if self._gridOverloadReleaseCount >= releaseCycles:
+            self._releaseGridOverload(logOnly)
+      else:
+        # In the hysteresis gap between releaseThreshold and
+        # triggerThreshold - neither escalating nor counting toward
+        # release. Holds whatever state is currently in effect steady,
+        # resetting both progress counters so only genuinely consecutive
+        # readings on either side count towards the next transition.
+        self._gridOverloadSustainedCount = 0
+        self._gridOverloadReleaseCount = 0
+    except Exception as e:
+      logging.critical('Error at %s', '_checkGridCurrentLimit', exc_info=e)
+
+  def _releaseGridOverload(self, logOnly):
+    '''
+    Restores whatever amp/frc value this fork itself saved immediately
+    before intervening in _checkGridCurrentLimit(), and resets the state
+    machine back to 'normal'. Separated into its own method since it's
+    called both from the normal release path (sustained safe cycles) and
+    from the config-disabled-mid-override path (always logOnly=False there,
+    since disabling the feature outright should always actually release
+    any real override in effect, regardless of which mode set it).
+    '''
+    logPrefix = "[LOG ONLY, not applied] " if logOnly else ""
+    if self._gridOverloadSavedFrc is not None:
+      if not logOnly:
+        self._setFrc(self._gridOverloadSavedFrc)
+      self._gridOverloadSavedFrc = None
+    if self._gridOverloadSavedAmp is not None:
+      if not logOnly:
+        ok = self._setGoeChargerValueV2('amp', self._gridOverloadSavedAmp)
+        if ok:
+          self._lastCommandedAmp = self._gridOverloadSavedAmp
+      self._gridOverloadSavedAmp = None
+    logging.info("%sGridCurrentLimit: phase current back within safe margin - restoring normal operation" % logPrefix)
+    self._gridOverloadState = 'normal'
+    self._gridOverloadSustainedCount = 0
+    self._gridOverloadReleaseCount = 0
+    self._gridOverloadMissingReadingCount = 0
+
   def _pushPvSurplusValues(self):
     '''
     Reads PV/grid/battery power from Venus OS and forwards it in the go-e's
@@ -987,6 +1220,10 @@ class DbusGoeChargerService:
             # external lmo-change detection just above - see the method's
             # own docstring for the full reasoning.
             self._updateBatteryDischargeLock(carForTiming)
+
+            # Also checked every cycle, independent of charge mode - see the
+            # method's own docstring for the full reasoning.
+            self._checkGridCurrentLimit(data)
           else:
             currentLmo = None
 
@@ -999,14 +1236,32 @@ class DbusGoeChargerService:
 
           # car (go-e): 0=Unknown/Error, 1=Idle, 2=Charging, 3=WaitCar,
           # 4=Complete, 5=Error (can also be null on an internal error).
-          # Venus /Status: 0=Disconnected, 1=Connected, 2=Charging, 3=Charged,
-          # 4=Waiting for sun, 5=Waiting for RFID, 6=Waiting for start,
-          # 8=Ground fault, 9=Welded contacts, 11=Residual current,
-          # 13=Overvoltage, 14=Overheating.
+          # Venus /Status (confirmed against the official Venus OS dbus-api
+          # wiki, evcharger section): 0=Disconnected, 1=Connected,
+          # 2=Charging, 3=Charged, 4=Waiting for sun, 5=Waiting for RFID,
+          # 6=Waiting for start, 7=Low SOC, 8=Ground test error,
+          # 9=Welded contacts error, 10=CP input test error (shorted),
+          # 11=Residual current detected, 12=Undervoltage detected,
+          # 13=Overvoltage detected, 14=Overheating detected, 15-19=reserved,
+          # 20=Charging limit. Status=1 (Connected) is not currently
+          # emitted - WaitCar(3) is mapped to 6 (Waiting for start)
+          # instead, since go-e gives no further signal to distinguish a
+          # merely-connected-and-idle car from one gating an imminent
+          # start. Status=7 (Low SOC) refers to the HOME/system battery
+          # SOC, not the EV's - confirmed via real Victron community
+          # threads about Victron's own EVCS product, where this is
+          # communicated from the GX device to the charger. This fork now
+          # sets it directly whenever BatteryPriorityMinSoc is pausing
+          # charging (see override below), since that is exactly this
+          # condition. Status=12 (Undervoltage) remains genuinely
+          # unreachable - go-e's err enum has no undervoltage code, only
+          # Overvolt.
           # car==4 needs go-e's modelStatus to disambiguate WHY (paused vs.
           # genuinely finished) - see README Findings ("Detailed /Status
-          # reporting"). Only modelStatus 4/17 are live-confirmed; err
-          # mappings below are from go-e's own docs, not live-tested.
+          # reporting"). Only modelStatus 4/17 are live-confirmed; the err
+          # mappings below are confirmed against the official API v2 field
+          # reference but not live-tested (this fork has not encountered a
+          # real fault condition to verify against).
           carValue = data['car']
           if carValue is None:
             status = 0
@@ -1015,7 +1270,20 @@ class DbusGoeChargerService:
           elif int(carValue) == 2:
             status = 2
           elif int(carValue) == 3:
-            status = 6
+            # Found on reconsideration: "WaitCar" (per go-e's own IFTTT
+            # integration docs, "Wait for Car") means the go-e itself is
+            # waiting for the VEHICLE to request charging (CP handshake) -
+            # a normal, unremarkable transient state right after plugging
+            # in, not something being held back externally. This is a
+            # better fit for Venus Status=1 ("Connected") than 6 ("Waiting
+            # for start"), which better describes something actively
+            # gating an otherwise-ready session. Distinguished here using
+            # this fork's own last-commanded frc value (not car/modelStatus
+            # alone, which can't tell the two apart): if we ourselves are
+            # currently forcing off (frc=1, e.g. Manual entered before any
+            # charging ever started), that IS an active hold - Status=6.
+            # Otherwise, genuinely just Status=1.
+            status = 6 if self._lastCommandedFrc == 1 else 1
           elif int(carValue) == 4:
             modelStatus = int(data['modelStatus']) if 'modelStatus' in data and data['modelStatus'] is not None else None
             if modelStatus == 4:
@@ -1029,31 +1297,86 @@ class DbusGoeChargerService:
               # exactly what "waiting for sun" is meant to represent.
               status = 4
             elif modelStatus == 2:
-              # Documented, not live-tested (this fork does not use RFID).
+              # go-e's own modelStatus enum names this
+              # NotChargingBecauseAccessControlWait - this fork's user
+              # actively uses RFID, so this path is genuinely reachable
+              # (not just documented) - not separately live-verified here,
+              # but expected to trigger correctly when a card tap is
+              # pending.
               status = 5
+            elif modelStatus == 6:
+              # go-e's own modelStatus enum names this
+              # NotChargingBecauseEnergyLimit - this is the go-e's own
+              # per-session energy limit (the 'dwo' key, e.g. "stop after
+              # 5 kWh this session") having been reached. Confirmed against
+              # the official modelStatus enum, not live-tested (this fork's
+              # own installation does not use this go-e feature).
+              status = 20
             else:
               # No known pause reason matched - genuinely finished/charged.
               status = 3
           elif int(carValue) == 5:
             errValue = int(data['err']) if 'err' in data and data['err'] is not None else None
+            # err enum confirmed against the official go-e API v2 field
+            # reference (apikeys-en.md): None=0, FiAc=1, FiDc=2, Phase=3,
+            # Overvolt=4, Overamp=5, Diode=6, PpInvalid=7, GndInvalid=8,
+            # ContactorStuck=9, ContactorMiss=10, FiUnknown=11, Unknown=12,
+            # Overtemp=13, NoComm=14, StatusLockStuckOpen=15,
+            # StatusLockStuckLocked=16, Reserved20-24.
             if errValue == 8:
               status = 8   # GndInvalid -> Ground fault
             elif errValue == 9:
               status = 9   # ContactorStuck -> Welded contacts
-            elif errValue == 1:
-              status = 11  # FiAc (RCD) -> Residual current detected
+            elif errValue == 7:
+              status = 10  # PpInvalid -> CP input test error (shorted)
+            elif errValue == 1 or errValue == 2:
+              status = 11  # FiAc/FiDc (AC/DC residual current) -> Residual current detected
             elif errValue == 4:
               status = 13  # Overvolt -> Overvoltage
             elif errValue == 13:
               status = 14  # Overtemp -> Overheating
             else:
-              # No confident specific mapping for this err value - still
-              # correctly signals SOME error rather than "Disconnected".
-              # Closest generic fit in the Venus enum without a dedicated
-              # "unspecified error" code.
+              # Remaining go-e err values (Phase, Overamp, Diode,
+              # ContactorMiss, FiUnknown, Unknown, NoComm,
+              # StatusLockStuckOpen/Locked) have no confident, specific
+              # Venus equivalent - Venus also has no dedicated "unspecified
+              # error" code (15-19 are reserved, not to be used). Falls
+              # back to Overheating as the closest generic "something is
+              # wrong" signal - still correctly shows SOME error rather
+              # than "Disconnected", just not the precise cause.
               status = 14
           else:
             status = 0
+
+          # Override: our own BatteryPriorityMinSoc pause takes priority
+          # over whatever the go-e's own car/modelStatus would otherwise
+          # map to. Confirmed via real Victron community threads about
+          # Victron's own EVCS product that Status=7 ("Low SOC") refers to
+          # the home/system battery SOC being below a charger-specific
+          # threshold - communicated from the GX device to the charger -
+          # not the vehicle's own SOC as initially assumed. This is exactly
+          # what BatteryPriorityMinSoc represents, so this fork can
+          # confidently report it accurately instead of leaving it to
+          # whatever generic pause reason the go-e itself reports.
+          if self._batteryPriorityPaused:
+            status = 7
+          # Override: this fork's own GridCurrentLimit safety intervention
+          # takes priority even over BatteryPriorityMinSoc above - protecting
+          # the house connection fuse is a more urgent concern than the
+          # battery-priority pause. Uses Status=20 ("Charging limit"),
+          # already used elsewhere in this fork for go-e's own per-session
+          # energy limit (modelStatus=6) - both genuinely share the same
+          # meaning ("charging is being deliberately capped/stopped by an
+          # external limit, not a fault"). Status=11 ("Residual current
+          # detected") was considered and rejected: that specifically means
+          # an RCD/GFCI trip (a real ground-fault/leakage condition), a
+          # different electrical phenomenon from a phase simply being near
+          # its rated current - showing that here would be actively
+          # misleading. Only applied in GridCurrentLimitMode=2 (active) -
+          # in log-only mode (1), nothing was actually done to the charger,
+          # so showing this here would misrepresent what's really happening.
+          if self._gridOverloadState != 'normal' and self._getSetting('GridCurrentLimitMode', 0) == 2:
+            status = 20
           self._dbusservice['/Status'] = status
 
           #logging
@@ -1083,6 +1406,8 @@ class DbusGoeChargerService:
             activeFlags.append('force_start_active')
           if self._savedEssMinSoc is not None:
             activeFlags.append('discharge_lock_active')
+          if self._gridOverloadState != 'normal':
+            activeFlags.append('grid_overload_%s' % self._gridOverloadState)
           currentSocForLog = self._safeGetValue(self._batterySocItem, '/Dc/Battery/Soc')
           currentEssMinSocForLog = self._safeGetValue(self._essMinSocItem, '/Settings/CGwacs/BatteryLife/MinimumSocLimit')
           logging.debug("State: car=%s SOC=%s%% amp_ceiling=%s frc=%s ESS_MinSoc=%s%% flags=%s" %

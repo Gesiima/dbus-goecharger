@@ -64,6 +64,10 @@ monitoring only, `/Mode` stays read-only.
 - **Prevent home battery discharge during Manual/Scheduled charging** -
   optional, mirrors an equivalent evcc feature; see "Configuration
   reference" and "Findings" below.
+- **Grid current safety limit** - optional, protects the house connection
+  fuse (SLS) against overload from the EV charger plus other simultaneous
+  loads, in all charge modes; see "Configuration reference" and "Findings"
+  below.
 - **Sync on external change:** if the mode (or, for `/AutoStart`, `psm`) is
   changed directly in the go-e app, the corresponding Venus OS path follows
   automatically.
@@ -329,6 +333,44 @@ reasoning. This script still reads the current value (only for
   when `CheckEssMinSocAtStartup=1`. If the switch is on but this isn't set,
   a warning is logged and the check is skipped rather than failing.
 
+- **`GridCurrentLimitMode`** *(live)*: `0` or omit = off (default, feature
+  fully skipped). `1` = log only - the full state machine below runs
+  exactly as it would live, including every `WARNING`-level log line, but
+  the actual `amp`/`frc` write calls are skipped entirely. Lets you observe
+  what this feature *would* do against your real house's load patterns
+  before trusting it to actually intervene - every log line carries an
+  explicit `[LOG ONLY, not applied]` prefix so it's unambiguous. `2` =
+  active, writes `amp`/`frc` for real.
+- **`GridCurrentLimit`** *(live)*: the per-phase current limit itself, in
+  Amps (e.g. a "35A SLS" means `35`, since each phase of a typical
+  3-phase house connection is individually rated at that current, not the
+  sum). Only takes effect when `GridCurrentLimitMode` is `1` or `2` -
+  protects the house connection fuse (SLS) against overload from the EV
+  charger plus other simultaneous loads. Applies in ALL charge modes as a
+  safety overlay - the only feature in this fork that writes `amp`/`frc`
+  during Manual. See "Findings" below for the full design rationale and
+  why this monitors actual per-phase current, not power.
+- **`GridCurrentSafetyMargin`** *(live)*: default `3` (A). Subtracted from
+  `GridCurrentLimit` to get the trigger threshold - e.g. `35` and `3`
+  together trigger at `32A`, not exactly at the SLS's own trip point.
+- **`GridCurrentReleaseMargin`** *(live)*: default `2` (A), on top of
+  `GridCurrentSafetyMargin`. Deliberate hysteresis: releasing back to full
+  current requires the phase current to drop further below the trigger
+  threshold than what triggered the reduction in the first place (e.g.
+  trigger at `32A`, only release below `30A`) - prevents flapping back and
+  forth if the load happens to hover right around a single shared
+  threshold. Safety-first by design: when in doubt (current sitting
+  between the two thresholds), this fork holds whatever state it's
+  currently in rather than switching either way.
+- **`GridCurrentMinAmp`** *(live)*: default `6` (A). The safe minimum this
+  fork reduces `amp` to once triggered, before considering a full pause.
+- **`GridCurrentSustainedCycles`** *(live)*: default `3`. Consecutive
+  over-threshold cycles required before escalating one step (normal ->
+  reduced -> paused) - avoids reacting to a single brief spike.
+- **`GridCurrentReleaseCycles`** *(live)*: default `3`. Consecutive
+  under-threshold cycles required before fully restoring normal
+  operation - fully automatic, no manual re-enable needed.
+
 ### `[ONPREMISE]`
 
 Both required (no code-level fallback).
@@ -516,23 +558,65 @@ of taking down the whole process.
 While a vehicle is connected but not charging, the official Venus OS
 `evcharger` status enum distinguishes several reasons (e.g. "waiting for
 sun", "waiting for RFID") that go-e's `car` alone cannot tell apart. This
-fork additionally reads go-e's `modelStatus` to pick the correct Venus
-status. **Corrected after live testing:** the disambiguation applies when
-`car==4`, NOT `car==3` as the official state names alone would suggest - on
-this device, go-e reports `car==4` ("charging finished, vehicle still
-connected") for both a genuinely completed session *and* paused/force-off
-states. Confirmed live: `modelStatus 4` (this fork's `frc=1` hard-stop) ->
-Venus `6`; `modelStatus 17` (soft pause, insufficient surplus) -> Venus `4`
-("waiting for sun"); anything else falls back to "Charged" (`3`).
+fork additionally reads go-e's `modelStatus`/`err`, and in two cases its
+own internal state, to pick the correct Venus status. Full mapping,
+confirmed against the official Venus OS dbus-api wiki and the official
+go-e API v2 field reference:
 
-**Also added:** `car==5` ("Error") was previously unhandled and silently
-fell through to `/Status=0` ("Disconnected"), hiding a real error behind a
-misleading display. go-e's `err` key now picks the closest matching Venus
-error status where reasonably confident (none of these specific mappings
-have been live-tested - no real error occurred during development, please
-verify against the app if this ever triggers). `car` can also be `null` on
-an internal error per the docs - handled defensively (`/Status=0`) instead
-of crashing on `int(None)`.
+| Venus `/Status` | Meaning | Set when |
+|---|---|---|
+| `0` | Disconnected | `car=null`, `car=1` (Idle), or `car` invalid |
+| `1` | Connected | `car=3` (WaitCar) **and** this fork's own `frc≠1` (nothing actively holding it back) |
+| `2` | Charging | `car=2` |
+| `3` | Charged | `car=4` and no known `modelStatus` below matched |
+| `4` | Waiting for sun | `car=4` and `modelStatus=17` |
+| `5` | Waiting for RFID | `car=4` and `modelStatus=2` |
+| `6` | Waiting for start | `car=3` and this fork's own `frc=1` (actively holding it back) **or** `car=4` and `modelStatus=4` |
+| `7` | Low SOC | Override: `BatteryPriorityMinSoc` pause is active (the **home** battery, not the EV's) |
+| `8` | Ground test error | `car=5` and `err=8` (GndInvalid) |
+| `9` | Welded contacts error | `car=5` and `err=9` (ContactorStuck) |
+| `10` | CP input test error (shorted) | `car=5` and `err=7` (PpInvalid) |
+| `11` | Residual current detected | `car=5` and `err=1` (FiAc) or `err=2` (FiDc) - the RCD/FI safety trip, not a grid overload |
+| `12` | Undervoltage detected | *unreachable* - go-e's `err` enum has no undervoltage code |
+| `13` | Overvoltage detected | `car=5` and `err=4` (Overvolt) |
+| `14` | Overheating detected | `car=5` and `err=13` (Overtemp), **or** the fallback for every other `err` value (`Phase`, `Overamp`, `Diode`, `ContactorMiss`, `FiUnknown`, `Unknown`, `NoComm`, both lock-stuck codes) - Venus has no dedicated "unspecified error" code |
+| `15`-`19` | *(reserved)* | - |
+| `20` | Charging limit | `car=4` and `modelStatus=6` (go-e's own per-session `dwo` energy limit reached), **or** override: `GridCurrentLimit` is actively intervening (`GridCurrentLimitMode=2` only) |
+
+Live-confirmed: `0`-`7`, `20`. Documented against the official references
+but not live-tested (no real fault has occurred during development):
+`8`-`14`.
+
+**The `car==4` disambiguation was corrected after live testing** - it
+applies when `car==4`, NOT `car==3` as the state names alone might
+suggest. On this device, go-e reports `car==4` ("charging finished,
+vehicle still connected") for both a genuinely completed session *and*
+paused/force-off states.
+
+**`car==3` needed a second look, and a self-correction.** Per go-e's own
+IFTTT integration docs, this state is named "Wait for Car" - the go-e
+itself is waiting for the *vehicle* to request charging (CP handshake), a
+normal transient state right after plugging in, not something being
+actively held back. That's `Status=1`, not the `6` this fork used
+initially - distinguished using this fork's own last-commanded `frc`
+value, since `car`/`modelStatus` alone can't tell the two cases apart.
+
+**`car==5` ("Error") was previously unhandled entirely**, silently
+falling through to `/Status=0` ("Disconnected") and hiding a real error
+behind a misleading display. `car` can also be `null` on an internal
+error per the docs - handled defensively (`/Status=0`) instead of
+crashing on `int(None)`.
+
+**`Status=7` ("Low SOC") needed a self-correction too.** Initially assumed
+unreachable (thought it meant the EV's own SOC, which go-e never reports
+over this API) - corrected after finding real Victron community threads
+about Victron's own EVCS product, where this exact status is driven by
+the GX device communicating **system** battery SOC to the charger (e.g.
+"once house batteries are charged to above start-soc, car charging will
+start"). That's precisely what `BatteryPriorityMinSoc` represents here, so
+`/Status` is now explicitly overridden to `7` whenever that pause is
+active, instead of falling through to whatever generic reason the go-e's
+own `car`/`modelStatus` happens to report for the resulting `frc=1`.
 
 **`/Connected` now reflects actual reachability, not just a startup value.**
 Previously set to `1` once at startup and never updated - if the go-e became
@@ -820,6 +904,116 @@ this way. No fix is provided for this - doing so would require directly
 managing the DC-coupled chargers' own behaviour, a materially bigger scope
 than anything else in this fork.
 
+### `GridCurrentLimit`: protecting the house connection fuse without go-e's own dynamic load balancing
+
+go-e's own **static** load balancing (`loe`/`lot`/`loty=0`, built into the
+charger, no extra hardware) only coordinates between multiple go-e
+chargers - confirmed via a real go-e community discussion: *"static load
+balancing... does not consider your other loads like ovens or water
+heaters."* Genuine **dynamic** load balancing, which does react to other
+house loads, requires the separate "go-e Controller" hardware accessory
+with its own current-transformer measurement - not something every go-e
+owner has.
+
+This fork achieves an equivalent safety net using current measurement
+Venus OS already has from its own grid meter, at no extra cost. Monitors
+actual per-phase **current** (A), not power - deliberately: with typically
+single-phase charging, one phase can be near its rated limit while
+aggregate power still looks unremarkable. This exact concern was raised in
+a real go-e API discussion about avoiding "a situation where aggregate
+grid usage is 'medium', but one of the phases is near its limit." A "35A
+SLS" (Selektiver Leitungsschutzschalter, the main house fuse) means 35A on
+**each** phase of a 3-phase connection, not a 35A total - `GridCurrentLimit`
+is specified per-phase to match.
+
+**Escalates one step at a time**, each requiring `GridCurrentSustainedCycles`
+consecutive over-threshold cycles to avoid reacting to a brief spike:
+`amp` forced down to `GridCurrentMinAmp` first; only if the phase current
+is *still* over threshold even at that reduced amp (meaning other house
+loads alone already exceed the safety margin) does it escalate further to
+a full pause (`frc=1`). If `amp` is already at or below `GridCurrentMinAmp`
+at the moment of the first over-threshold detection, escalates straight to
+pausing - reducing further wouldn't have helped.
+
+**Recovery is symmetric and fully automatic** (per explicit request - no
+manual re-enable step): `GridCurrentReleaseCycles` consecutive
+under-threshold cycles restore the exact `amp`/`frc` values that were in
+effect immediately before this fork's own intervention, read live from the
+go-e at the moment of first intervening rather than assumed from mode
+logic. This matters specifically for Manual mode, where this fork
+otherwise never touches `amp` at all - restoring the live-captured value
+(rather than e.g. the device's absolute max) correctly hands control back
+to whatever current the user had actually set themselves, not an assumed
+default. In Auto mode, restoring is effectively a no-op in practice, since
+that mode's own per-cycle ceiling logic reasserts itself immediately
+afterwards regardless.
+
+**Deliberately not implemented:** using `ama` (the go-e's own hardware max
+current field) instead of `amp` as the override lever - this was
+considered, since it would act as a cleaner, additive ceiling independent
+of whatever `amp` any mode logic wants. Rejected because restoring `ama`
+to "normal" on release would need its own separate known-good value
+(the device's true installed maximum), rather than simply replaying back
+whatever was live-captured moments before, as `amp` allows.
+
+**`GridCurrentLimitMode` provides a dry-run step before trusting this with
+real hardware.** Since this is the one feature in this fork that can pause
+charging entirely based on a live measurement it doesn't fully control the
+tuning of (every house's load pattern differs), `1` ("log only") runs the
+complete state machine - detection, escalation, and recovery - with every
+`WARNING` log line exactly as it would appear live, but skips the actual
+`amp`/`frc` writes. This lets `GridCurrentLimit`/`GridCurrentSafetyMargin`/
+the cycle counts be tuned and observed against a real house's load
+patterns for a while before switching to `2` ("active") and letting it
+actually intervene.
+
+**Confirmed live: reacts correctly to overload even without an active
+charging session.** The check runs completely independent of `car` state -
+if the phase current is already over the limit before any vehicle is even
+connected, this fork still escalates to `frc=1`, which then correctly
+blocks a vehicle from starting to charge at all once one is plugged in and
+requests it, for as long as the overload persists. This isn't a special
+case that needed separate handling - it falls directly out of the design
+never having been gated on whether a car happens to be charging right now.
+
+**Found and fixed, on explicit request, three places where "safety over
+convenience" needed to be more than just a stated principle:**
+
+1. **Release used to share the same threshold as the trigger.** A load
+   sitting right at that single threshold could have caused rapid
+   flapping (reduce -> release -> reduce -> release), which is neither
+   safe nor good for the contactor (see "frc physically clicks..." above).
+   `GridCurrentReleaseMargin` now creates genuine hysteresis - a
+   deliberate gap between the trigger and release thresholds. Confirmed
+   live: with the current sitting *inside* that gap for several
+   consecutive cycles, the state holds steady with no flapping at all.
+2. **A missing/unavailable current reading used to be silently skipped**,
+   doing nothing - meaning a sensor or communication problem could leave
+   this feature blind indefinitely, with no indication anything was wrong.
+   Now escalates to pausing as a fail-safe after `GridCurrentSustainedCycles`
+   consecutive missing readings - not being able to verify the house
+   connection is within its rated limit is treated the same as knowing it
+   isn't, not as "probably fine".
+3. **No distinct `/Status` was shown while this feature was intervening** -
+   a user watching the Venus GUI would see a generic reason (or none) with
+   no indication the charger was actually being safety-limited. Overridden
+   to `Status=20` ("Charging limit") while active - the same code this
+   fork already uses for go-e's own per-session energy limit, since both
+   genuinely mean the same thing: charging deliberately capped/stopped by
+   an external limit, not a fault. **`Status=11` ("Residual current
+   detected") was considered and explicitly rejected** for this, despite
+   initially seeming to fit - that specifically means an RCD/GFCI trip (a
+   real ground-fault/leakage condition), a different electrical phenomenon
+   from a phase simply being near its rated current; showing it here would
+   be actively misleading about what's actually happening. This override
+   only applies in `GridCurrentLimitMode=2` (active) - in log-only mode,
+   nothing was actually done to the charger, so showing it would
+   misrepresent reality.
+
+Disabled by default (`GridCurrentLimitMode=0`) - this is an opt-in safety
+net for installations with a lower-rated house connection, not a universal
+default.
+
 ### Phase-switch anti-flapping lock (`mptwt`) can cause a stop/start loop
 
 Not fixed/handled by this fork, but worth understanding: the go-e has a
@@ -979,6 +1173,16 @@ these values.)
 Based on the work of [vikt0rm](https://github.com/vikt0rm/dbus-goecharger),
 inspired by [fabian-lauer](https://github.com/fabian-lauer/dbus-shelly-3em-smartmeter)
 and [trixing](https://github.com/trixing/venus.dbus-twc3).
+
+Several features in this fork (`PreventBatteryDischarge`, and the general
+approach behind `GridCurrentLimit`) were inspired by concepts found in
+[evcc](https://github.com/evcc-io/evcc) (MIT-licensed) - no evcc code was
+used anywhere in this project; everything here is an independent Python
+implementation against Victron's own dbus API, written from scratch based
+on the general idea and this fork's own testing. Where evcc's own
+documentation, source code, or issue tracker informed a specific design
+decision or surfaced a known failure mode, that's cited inline in
+"Findings" above with a direct link.
 
 This project is built collaboratively: the coding is done by Claude
 (Anthropic), while the features are developed together. All requirements,
